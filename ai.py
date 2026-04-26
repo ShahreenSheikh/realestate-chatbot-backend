@@ -7,6 +7,11 @@ from openai import OpenAI
 from datetime import datetime, timedelta
 from database import get_all_services, get_faqs, get_areas, get_projects, get_developers, get_payment_plans, get_crawled_properties 
 from models import Lead
+from hashlib import md5
+import time
+
+CACHE = {}
+CACHE_TTL = 300  # 5 minutes
 
 client = OpenAI(api_key=os.getenv("GROQ_API_KEY"), base_url="https://api.groq.com/openai/v1")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
@@ -703,7 +708,9 @@ async def _process_booking(booking: dict, session: dict, language: str, source: 
         "agent_email": agent_email_status,
         "whatsapp": whatsapp_status,
     }
-
+def make_cache_key(session_id: str, message: str) -> str:
+    key = f"{session_id}:{message.lower().strip()}"
+    return md5(key.encode()).hexdigest()
 
 async def get_ai_response(session_id: str, user_message: str, source: str = "website") -> dict:
     language = detect_language(user_message)
@@ -722,6 +729,30 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
         }
 
     session = _sessions[session_id]
+
+    cache_key = make_cache_key(session_id, user_message)
+
+    lead = session.get("lead", {})
+    is_booking_flow = any([
+        lead.get("name"),
+        lead.get("email"),
+        lead.get("phone"),
+        lead.get("viewing_date"),
+        lead.get("viewing_time"),
+        session.get("booking_made"),
+    ])
+
+    # Check cache only for simple/general queries.
+    # Do not cache lead-capture or booking-flow messages.
+    if not is_booking_flow:
+        cached = CACHE.get(cache_key)
+        if cached:
+            if time.time() - cached["time"] < CACHE_TTL:
+                print("[CACHE HIT]")
+                return cached["response"]
+            else:
+                del CACHE[cache_key]
+
     lead_state = update_lead_state_from_message(session, user_message)
 
     now = datetime.utcnow()
@@ -817,10 +848,7 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             if state.get(k) and not booking.get(k):
                 booking[k] = state[k]
 
-        # IMPORTANT: Do not process a booking until required contact details exist.
-        # The LLM may output <BOOKING> too early. In that case, store any useful
-        # booking fields and ask the next missing question instead of creating
-        # calendar/email actions with empty attendee/contact data.
+        # Do not process a booking until required contact details exist.
         session_lead = session.setdefault("lead", {})
         for k in ["name", "email", "phone", "interest", "budget", "area", "viewing_date", "viewing_time"]:
             if booking.get(k):
@@ -850,7 +878,8 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
         session["history"] = session["history"][-20:]
 
     booking_for_response = booking if booking_made else None
-    return {
+
+    result = {
         "reply": reply,
         "language": language,
         "lead_captured": booking_made,
@@ -865,3 +894,13 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
         "area": booking_for_response.get("area") if booking_for_response else session.get("lead", {}).get("area"),
         "booking_status": session.get("booking_status", {}),
     }
+
+    # Save only simple, non-booking responses to cache.
+    if not is_booking_flow and not booking_made:
+        CACHE[cache_key] = {
+            "response": result,
+            "time": time.time(),
+        }
+        print("[CACHE SAVE]")
+
+    return result
