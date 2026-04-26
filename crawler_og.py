@@ -20,7 +20,6 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from credentials import get_credentials
 
 BASE_URL       = "https://zahrasignaturerealty.com"
 PROPERTIES_URL = f"{BASE_URL}/properties/"
@@ -66,7 +65,7 @@ HTTP_HEADERS = {
 # ── Google Sheets helpers ──────────────────────────────────────────────────────
 
 def _get_sheets():
-    creds = get_credentials(SCOPES)
+    creds = Credentials.from_service_account_file(SA_FILE, scopes=SCOPES)
     return build("sheets", "v4", credentials=creds).spreadsheets()
 
 
