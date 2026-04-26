@@ -1,6 +1,5 @@
 import os
 from datetime import timedelta
-
 import dateparser
 from googleapiclient.discovery import build
 from credentials import get_credentials
@@ -24,25 +23,20 @@ def create_viewing_event(
     time_str: str,
     notes: str = "",
 ) -> dict:
-    """
-    Create a Google Calendar event for a property viewing.
-    Works on Railway with service account credentials.
-    Does NOT invite attendees because service accounts cannot invite users
-    without Domain-Wide Delegation.
-    """
     try:
         parsed = dateparser.parse(
             f"{date_str} {time_str}",
             settings={
                 "PREFER_DATES_FROM": "future",
-                "RETURN_AS_TIMEZONE_AWARE": False,
+                "TIMEZONE": "Asia/Dubai",
+                "RETURN_AS_TIMEZONE_AWARE": True,
             },
         )
 
         if not parsed:
             raise ValueError(f"Invalid date/time: {date_str} {time_str}")
 
-        start_dt = parsed
+        start_dt = parsed.astimezone()
         end_dt = start_dt + timedelta(hours=1)
 
         event = {
@@ -56,18 +50,16 @@ def create_viewing_event(
                 f"{notes}"
             ),
             "start": {
-                "dateTime": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                "dateTime": start_dt.isoformat(),
                 "timeZone": "Asia/Dubai",
             },
             "end": {
-                "dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                "dateTime": end_dt.isoformat(),
                 "timeZone": "Asia/Dubai",
             },
             "reminders": {
                 "useDefault": False,
-                "overrides": [
-                    {"method": "popup", "minutes": 60},
-                ],
+                "overrides": [{"method": "popup", "minutes": 60}],
             },
         }
 

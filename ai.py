@@ -414,11 +414,70 @@ def next_missing_booking_question(session: dict, language: str):
     return None
 
 
-def fallback_collect_and_book_response(session: dict, user_message: str, language: str, source: str):
-    """Rule-based booking flow used when the LLM is unavailable/rate-limited.
+def fallback_missing_lead_question(session: dict, language: str) -> str:
+    """Professional fallback prompt when the LLM is unavailable.
 
-    This keeps the demo working even if Groq returns 429 or the model fails.
-    It uses the same session lead state already updated by update_lead_state_from_message().
+    Collects the minimum details needed for a human handoff and, if a viewing
+    time is supplied too, allows the deterministic booking engine to proceed.
+    """
+    lead = session.get("lead", {})
+
+    if not _valid_lead_value(lead.get("name")):
+        return (
+            "Our team is currently busy and will contact you shortly. Kindly share your name."
+            if language == "en"
+            else "فريقنا مشغول حالياً وسيتواصل معك قريباً. يرجى إرسال الاسم."
+        )
+    if not _valid_lead_value(lead.get("email")):
+        return (
+            "Thank you. Please share your email address."
+            if language == "en"
+            else "شكراً. يرجى إرسال البريد الإلكتروني."
+        )
+    if not _valid_lead_value(lead.get("phone")):
+        return (
+            "Please share your phone number so our team can contact you."
+            if language == "en"
+            else "يرجى إرسال رقم الهاتف حتى يتمكن فريقنا من التواصل معك."
+        )
+    if not _valid_lead_value(lead.get("interest")):
+        return (
+            "What type of property are you interested in — apartment, villa, townhouse, rent, buy, or investment?"
+            if language == "en"
+            else "ما نوع العقار الذي تهتم به؟ شقة، فيلا، تاون هاوس، إيجار، شراء، أم استثمار؟"
+        )
+    if not _valid_lead_value(lead.get("area")):
+        return (
+            "Which area are you interested in?"
+            if language == "en"
+            else "ما المنطقة التي تهتم بها؟"
+        )
+    if not _valid_lead_value(lead.get("viewing_date")) or not _valid_lead_value(lead.get("viewing_time")):
+        return (
+            "Our team is busy right now, we will contact you soon kindly let us know What date and time would you prefer for the viewing?"
+            if language == "en"
+            else "ما التاريخ والوقت المناسبان للمعاينة؟"
+        )
+
+    return (
+        "Thank you. Our team will contact you shortly."
+        if language == "en"
+        else "شكراً. سيتواصل معك فريقنا قريباً."
+    )
+
+
+def fallback_booking_ready(session: dict) -> bool:
+    """Fallback should not create a booking until all handoff details are present."""
+    lead = session.get("lead", {})
+    required = ["name", "email", "phone", "interest", "area", "viewing_date", "viewing_time"]
+    return all(_valid_lead_value(lead.get(k)) for k in required)
+
+
+def fallback_collect_and_book_response(session: dict, user_message: str, language: str, source: str):
+    """Rule-based booking flow used only when the LLM is unavailable/rate-limited.
+
+    It never sounds broken. It collects name, email, phone, property type, area,
+    and only creates a booking after those details plus viewing date/time exist.
     """
     lead = session.setdefault("lead", {})
 
@@ -429,7 +488,7 @@ def fallback_collect_and_book_response(session: dict, user_message: str, languag
             lead[key] = contact[key]
 
     booking = maybe_build_booking_from_state(session, language)
-    if booking and not session.get("booking_made"):
+    if booking and not session.get("booking_made") and fallback_booking_ready(session):
         return {
             "action": "book",
             "booking": booking,
@@ -438,15 +497,9 @@ def fallback_collect_and_book_response(session: dict, user_message: str, languag
             else f"تم التأكيد. موعد المعاينة بتاريخ {booking.get('viewing_date')} الساعة {booking.get('viewing_time')}. سيتواصل معك الوكيل قريباً.",
         }
 
-    q = next_missing_booking_question(session, language)
-    if q:
-        return {"action": "ask", "reply": q}
-
     return {
         "action": "ask",
-        "reply": "I can still help with the booking. Please share your preferred viewing date/time, name, email, and phone number."
-        if language == "en"
-        else "يمكنني مساعدتك في الحجز. يرجى إرسال تاريخ ووقت المعاينة والاسم والبريد الإلكتروني ورقم الهاتف.",
+        "reply": fallback_missing_lead_question(session, language),
     }
 
 

@@ -1,5 +1,6 @@
 import os
 import resend
+DEMO_MODE = os.getenv("DEMO_MODE", "true") == "true"
 
 resend.api_key = os.getenv("RESEND_API_KEY", "")
 
