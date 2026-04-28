@@ -2,6 +2,7 @@ import os
 import re
 import json
 import dateparser
+from logger import save_chat_log
 from database import save_lead
 from openai import OpenAI
 from datetime import datetime, timedelta
@@ -44,14 +45,15 @@ You are knowledgeable, concise, and trustworthy.
    - Budget if unknown
    - Timeline if unknown
 3. Recommend one relevant service, project, or area from the data below.
-4. If the client shows interest, tell them  more about the property and offer to schedule a viewing.
-5. For booking, collect missing details ONE AT A TIME in this order:
+4. If the client shows interest, tell them  more about the property details, how many room in the apartments, details for the villa etc, and the amenities it has.
+5. ask them if they want to know more about the property or move to booking, if they want to book, schedule the viewing
+6. For booking, collect missing details ONE AT A TIME in this order:
    - viewing date/time
    - name
    - email
    - phone
-6. If the user already gave a detail, do NOT ask for it again.
-7. After a booking is confirmed, continue answering the user's questions normally.
+7. If the user already gave a detail, do NOT ask for it again.
+8. After a booking is confirmed, continue answering the user's questions normally.
    - If they ask about the booked property, area, viewing, pricing, or next steps, answer helpfully using available property data.
    - Do NOT keep asking for booking details after booking is completed.
    - Do NOT say only “How can I help you next?” when the user asks a real question.
@@ -67,6 +69,8 @@ You MUST output booking ONLY in this exact JSON format:
 <BOOKING>{"name":"...","email":"...","phone":"...","interest":"...","budget":"...","area":"...","viewing_date":"...","viewing_time":"...","language":"..."}</BOOKING>
 
 Rules:
+- Tell details about the property before asking about scheduling.
+- Always answer the client's actual question first, even if it is in the middle of booking or contact collection. After answering, continue with the next missing booking detail.
 - MUST be valid JSON.
 - MUST use double quotes.
 - DO NOT output plain text inside BOOKING.
@@ -325,9 +329,26 @@ def update_lead_state_from_message(session: dict, user_message: str):
     if has_explicit_viewing_time(msg):
         dt = fallback_extract_datetime_from_message(msg)
         if dt:
-            lead["viewing_date"] = dt["viewing_date"]
-            lead["viewing_time"] = dt["viewing_time"]
+            only_time = (
+                re.fullmatch(r"\s*\d{1,2}\s*(:\d{2})?\s*(am|pm)\s*", msg.lower())
+                or re.fullmatch(r"\s*\d{1,2}:\d{2}\s*", msg.lower())
+            )
+            if only_time:
+                lead["viewing_time"] = dt["viewing_time"]
+            else:
+                lead["viewing_date"] = dt["viewing_date"]
+                lead["viewing_time"] = dt["viewing_time"]
             lead["raw_datetime"] = dt["raw_datetime"]
+    else:
+        date_only_words = [
+            "today", "tomorrow", "monday", "tuesday", "wednesday",
+            "thursday", "friday", "saturday", "sunday", "next"
+        ]
+        if any(w in msg.lower() for w in date_only_words):
+            dt = fallback_extract_datetime_from_message(msg)
+            if dt:
+                lead["viewing_date"] = dt["viewing_date"]
+                lead["raw_datetime"] = dt["raw_datetime"]
 
     # Budget
     budget_match = re.search(r"\b(?:aed\s*)?\d+(?:\.\d+)?\s*(?:k|K|m|M|million|aed|dirham|dirhams|usd|\$)?\b", msg)
@@ -404,20 +425,71 @@ def maybe_build_booking_from_state(session: dict, language: str):
         }
     return None
 
+def is_user_query(message: str) -> bool:
+    """Detect if user is asking a question (not giving booking info)."""
+    msg = (message or "").lower()
 
+    question_keywords = [
+        "what", "how", "why", "where", "when", "which",
+        "price", "cost", "details", "information",
+        "do you", "can you", "is there", "are there"
+    ]
+
+    return (
+        "?" in msg
+        or any(q in msg for q in question_keywords)
+    )
+    
 def next_missing_booking_question(session: dict, language: str):
     """Ask the next missing booking question in a stable order."""
     lead = session.get("lead", {})
-    if not _valid_lead_value(lead.get("viewing_date")) or not _valid_lead_value(lead.get("viewing_time")):
-        return "What date and time would you prefer for the viewing?"
-    if not _valid_lead_value(lead.get("name")):
-        return "Great. What is your name?"
-    if not _valid_lead_value(lead.get("email")):
-        return "Where should we send your booking confirmation?"
-    if not _valid_lead_value(lead.get("phone")):
-        return "What phone number should the agent contact you on?"
-    return None
 
+    has_date = _valid_lead_value(lead.get("viewing_date"))
+    has_time = _valid_lead_value(lead.get("viewing_time"))
+
+    if not has_date and not has_time:
+        return (
+            "What date and time would you prefer for the viewing?"
+            if language == "en"
+            else "ما التاريخ والوقت المناسبان للمعاينة؟"
+        )
+
+    if has_date and not has_time:
+        return (
+            "Great. What time would you prefer for the viewing?"
+            if language == "en"
+            else "رائع. ما الوقت المناسب للمعاينة؟"
+        )
+
+    if has_time and not has_date:
+        return (
+            "Great. What day would you prefer for the viewing?"
+            if language == "en"
+            else "رائع. ما اليوم المناسب للمعاينة؟"
+        )
+
+    if not _valid_lead_value(lead.get("name")):
+        return (
+            "Great. What is your name?"
+            if language == "en"
+            else "رائع. ما اسمك الكريم؟"
+        )
+
+    if not _valid_lead_value(lead.get("email")):
+        return (
+            "Can we have your email to send the booking confirmation?"
+            if language == "en"
+            else "هل يمكننا الحصول على بريدك الإلكتروني لإرسال تأكيد الحجز؟"
+        )
+
+    if not _valid_lead_value(lead.get("phone")):
+        return (
+            "What phone number should the agent contact you on?"
+            if language == "en"
+            else "ما رقم الهاتف الذي يمكن للوكيل التواصل معك عليه؟"
+        )
+
+    return None
 
 def fallback_missing_lead_question(session: dict, language: str) -> str:
     """Professional fallback prompt when the LLM is unavailable.
@@ -551,6 +623,9 @@ async def handle_llm_failure(session: dict, user_message: str, language: str, so
         reply = post_booking_fallback_reply(user_message, session, language)
         session["history"].append({"role": "user", "content": user_message})
         session["history"].append({"role": "assistant", "content": reply})
+
+        save_chat_log(session.get("id"), user_message, reply)
+        
         if len(session["history"]) > 20:
             session["history"] = session["history"][-20:]
         return {
@@ -794,14 +869,32 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
 
     messages = [{"role": "system", "content": session["system_prompt"]}]
     messages += history_to_messages(session["history"])
-    messages.append({"role": "user", "content": user_message})
+
+    lead_now = session.get("lead", {})
+    booking_flow_active_now = any([
+        lead_now.get("viewing_date"),
+        lead_now.get("viewing_time"),
+        lead_now.get("name"),
+        lead_now.get("email"),
+        lead_now.get("phone"),
+    ])
+
+    llm_user_message = user_message
+    if booking_flow_active_now and is_user_query(user_message):
+        llm_user_message = (
+            user_message
+            + "\n\nImportant: Answer this question first using available property data. "
+            + "Do not ignore it. After answering, you may continue with the next missing booking detail."
+        )
+
+    messages.append({"role": "user", "content": llm_user_message})
 
     try:
         response = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=messages,
             temperature=0.2,
-            max_tokens=80,
+            max_tokens=150,
         )
         raw = response.choices[0].message.content
     except Exception as e:
@@ -814,6 +907,17 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
     reply = shorten(clean_reply(raw))
     booking = extract_booking(raw) if not session["booking_made"] else None
 
+    # ✅ HANDLE USER QUERY DURING BOOKING FLOW
+    if is_user_query(user_message):
+        ai_reply = reply  # AI answer first
+
+        next_q = next_missing_booking_question(session, language)
+
+        if next_q:
+            reply = f"{ai_reply}\n\n{next_q}"
+        else:
+            reply = ai_reply
+            
     # After booking, keep normal LLM conversation. Do not ask booking questions again.
     if session.get("booking_made"):
         session["history"].append({"role": "user", "content": user_message})
@@ -866,14 +970,13 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             reply = q or reply
     else:
         booking_made = False
-        # If booking flow is active, override repeated/confusing AI questions with the exact missing field.
-        if session.get("lead", {}).get("viewing_date") or "viewing" in reply.lower() or "confirmation" in reply.lower():
-            q = next_missing_booking_question(session, language)
-            if q:
-                reply = q
+        
 
     session["history"].append({"role": "user", "content": user_message})
     session["history"].append({"role": "assistant", "content": reply})
+
+    save_chat_log(session_id, user_message, reply)
+
     if len(session["history"]) > 20:
         session["history"] = session["history"][-20:]
 
