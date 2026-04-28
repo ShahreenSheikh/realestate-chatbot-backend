@@ -21,6 +21,8 @@ from datetime import datetime
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from credentials import get_credentials
+from dotenv import load_dotenv
+load_dotenv()
 
 BASE_URL       = "https://zahrasignaturerealty.com"
 PROPERTIES_URL = f"{BASE_URL}/properties/"
@@ -28,6 +30,7 @@ SHEET_ID       = os.getenv("GOOGLE_SHEET_ID")
 SA_FILE        = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
 SCOPES         = ["https://www.googleapis.com/auth/spreadsheets"]
 CRAWLED_TAB    = "crawled_properties"
+COMPANY_TAB    = "company_info"
 
 # Column order — must match HEADERS below
 HEADERS = [
@@ -362,6 +365,126 @@ def parse_property_detail(html: str, url: str) -> dict:
     }
 
 
+# ── Company/home/about crawler ───────────────────────────────────────────────
+
+def _clean_page_text(soup: BeautifulSoup, max_chars: int = 2500) -> str:
+    """Extract compact readable text from a normal marketing page."""
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+
+    chunks = []
+    for el in soup.find_all(["h1", "h2", "h3", "p", "li"]):
+        text = re.sub(r"\s+", " ", el.get_text(" ", strip=True))
+        if len(text) >= 35 and text not in chunks:
+            chunks.append(text)
+        if sum(len(c) for c in chunks) > max_chars:
+            break
+    return "\n".join(chunks)[:max_chars]
+
+
+def _extract_contact_text(soup: BeautifulSoup) -> str:
+    text = soup.get_text(" ", strip=True)
+    emails = sorted(set(re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)))
+    phones = sorted(set(re.findall(r"(?:\+971|00971|0)?[\s\-]?(?:\d[\s\-]?){8,12}", text)))
+    contact_parts = []
+    if emails:
+        contact_parts.append("Emails: " + ", ".join(emails[:3]))
+    if phones:
+        contact_parts.append("Phones: " + ", ".join(phones[:3]))
+    return " | ".join(contact_parts)[:700]
+
+
+async def crawl_company_info() -> dict:
+    """Crawl company identity from home/about/contact pages for the LLM."""
+    candidate_pages = {
+        "home": [BASE_URL, f"{BASE_URL}/"],
+        "about": [f"{BASE_URL}/about/", f"{BASE_URL}/about-us/", f"{BASE_URL}/our-story/"],
+        "contact": [f"{BASE_URL}/contact/", f"{BASE_URL}/contact-us/"],
+    }
+
+    result = {
+        "company_name": "Zahra Signature Realty",
+        "home_content": "",
+        "about_content": "",
+        "contact_info": "",
+    }
+
+    for section, urls in candidate_pages.items():
+        for url in urls:
+            html = await fetch_page(url)
+            if not html:
+                continue
+            soup = BeautifulSoup(html, "lxml")
+            page_text = _clean_page_text(soup)
+            contact_text = _extract_contact_text(soup)
+
+            if section == "home" and page_text:
+                result["home_content"] = page_text
+            elif section == "about" and page_text:
+                result["about_content"] = page_text
+            elif section == "contact" and (page_text or contact_text):
+                result["contact_info"] = contact_text or page_text[:700]
+
+            if contact_text and not result["contact_info"]:
+                result["contact_info"] = contact_text
+
+            if section in ("home", "about") and page_text:
+                break
+            if section == "contact" and result["contact_info"]:
+                break
+
+        await asyncio.sleep(0.8)
+
+    return result
+
+
+def _ensure_company_tab(sheets):
+    """Create company_info tab and headers if missing."""
+    meta = sheets.get(spreadsheetId=SHEET_ID).execute()
+    existing = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    headers = ["company_name", "home_content", "about_content", "contact_info", "last_updated"]
+
+    if COMPANY_TAB not in existing:
+        sheets.batchUpdate(
+            spreadsheetId=SHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": COMPANY_TAB}}}]},
+        ).execute()
+        print(f"[Sheets] Created tab '{COMPANY_TAB}'.")
+
+    sheets.values().update(
+        spreadsheetId=SHEET_ID,
+        range=f"{COMPANY_TAB}!A1",
+        valueInputOption="USER_ENTERED",
+        body={"values": [headers]},
+    ).execute()
+
+
+def save_company_info(info: dict) -> dict:
+    """Save one latest company profile row to Google Sheets."""
+    try:
+        sheets = _get_sheets()
+        _ensure_company_tab(sheets)
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+        row = [
+            info.get("company_name", "Zahra Signature Realty"),
+            info.get("home_content", "")[:2500],
+            info.get("about_content", "")[:2500],
+            info.get("contact_info", "")[:700],
+            now,
+        ]
+        sheets.values().update(
+            spreadsheetId=SHEET_ID,
+            range=f"{COMPANY_TAB}!A2",
+            valueInputOption="USER_ENTERED",
+            body={"values": [row]},
+        ).execute()
+        print("[Sheets] Company info updated.")
+        return {"status": "success", "updated": True, "last_updated": now}
+    except Exception as e:
+        print(f"[Sheets] Company info save error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 async def run_crawler() -> dict:
@@ -370,9 +493,12 @@ async def run_crawler() -> dict:
     print(f"[Crawler] Target: {PROPERTIES_URL}")
     print(f"{'='*50}")
 
+    company_info = await crawl_company_info()
+    company_stats = save_company_info(company_info)
+
     listing_html = await fetch_page(PROPERTIES_URL)
     if not listing_html:
-        return {"status": "error", "message": "Could not fetch listings page", "count": 0}
+        return {"status": "error", "message": "Could not fetch listings page", "count": 0, "company_stats": company_stats}
 
     property_urls = parse_property_links(listing_html)
     if not property_urls:
@@ -388,13 +514,17 @@ async def run_crawler() -> dict:
             print(f"           ✓ {prop['project_name']} ({prop['developer']}, {prop['location']})")
         await asyncio.sleep(1.5)   # polite crawl delay
 
-    stats  = upsert_to_sheet(properties)
+    stats = upsert_to_sheet(properties)
+
     result = {
-        "status":     "success",
-        "count":      len(properties),
+        "status": "success",
+        "count": len(properties),
         "crawled_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
-        "stats":      stats,
+        "stats": stats,
+        "company_stats": company_stats,
+        "company": company_info,
         "properties": [p["project_name"] for p in properties],
     }
+
     print(f"\n[Crawler] Finished: {len(properties)} properties processed.")
     return result
