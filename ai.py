@@ -6,7 +6,7 @@ from logger import save_chat_log
 from database import save_lead
 from openai import OpenAI
 from datetime import datetime, timedelta
-from database import get_all_services, get_faqs, get_areas, get_projects, get_developers, get_payment_plans, get_crawled_properties 
+from database import get_all_services, get_faqs, get_areas, get_projects, get_developers, get_payment_plans, get_crawled_properties, get_company_info 
 from models import Lead
 from hashlib import md5
 import time
@@ -17,7 +17,8 @@ CACHE_TTL = 300  # 5 minutes
 client = OpenAI(api_key=os.getenv("GROQ_API_KEY"), base_url="https://api.groq.com/openai/v1")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 AGENT_NAME = os.getenv("AGENT_NAME", "Omar Hassan")
-AGENCY = os.getenv("AGENCY_NAME", "Zahra Signature Realty") 
+AGENCY = os.getenv("AGENCY_NAME", "Zahra Signature Realty")
+AGENCY_CONTEXT = os.getenv("AGENCY_CONTEXT", "Dubai property brokerage focused on trusted, premium real estate guidance.")
 
 SYSTEM_PROMPT = """You are a professional real estate assistant for {AGENCY}, a Dubai property brokerage.
 
@@ -44,15 +45,28 @@ You are knowledgeable, concise, and trustworthy.
    - Preferred area if unknown
    - Budget if unknown
    - Timeline if unknown
-3. Recommend one relevant service, project, or area from the data below.
-4. If the client shows interest, tell them  more about the property details, how many room in the apartments, details for the villa etc, and the amenities it has.
-5. ask them if they want to know more about the property or move to booking, if they want to book, schedule the viewing
-6. For booking, collect missing details ONE AT A TIME in this order:
-   - viewing date/time
-   - name
-   - email
-   - phone
-7. If the user already gave a detail, do NOT ask for it again.
+3. When recommending a property:
+   - ALWAYS give 2–3 relevant options (not just one)
+   - Mention:
+     • property type (apartment, villa, townhouse)
+     • location
+     • starting price (if available)
+     • payment plan (if available)
+
+4. After recommending, describe EACH option briefly:
+   - number of bedrooms (if known)
+   - key amenities (pool, gym, beach access, etc.)
+   - lifestyle (luxury, family-friendly, investment, waterfront, etc.)
+
+5. Make it feel like a real agent:
+   - highlight benefits (ROI, location advantage, lifestyle)
+   - keep it short but valuable
+
+6. ONLY move to booking AFTER:
+   - user clearly shows interest
+   - OR asks to schedule
+
+7. NEVER rush to ask for name/email before giving value
 8. After a booking is confirmed, continue answering the user's questions normally.
    - If they ask about the booked property, area, viewing, pricing, or next steps, answer helpfully using available property data.
    - Do NOT keep asking for booking details after booking is completed.
@@ -130,36 +144,113 @@ def is_placeholder(value: str) -> bool:
     return v in {"", "test", "none", "null", "your_whatsapp_token", "your_phone_number_id", "any_random_string"}
 
 
-async def build_system_prompt(language: str) -> str:
+def _safe_get(row: dict, key: str, default: str = "") -> str:
+    """Read sheet fields safely even if a column is missing."""
+    return str((row or {}).get(key, default) or "").strip()
+
+
+def _keywords(text: str) -> list:
+    """Small keyword extractor for demo-friendly sheet filtering, no vector DB needed."""
+    stop = {
+        "about", "tell", "please", "property", "properties", "dubai", "want", "need",
+        "looking", "interested", "information", "details", "price", "prices", "area",
+        "areas", "project", "projects", "plan", "plans", "payment", "what", "which",
+        "where", "when", "with", "from", "that", "this", "have", "there", "your",
+    }
+    words = re.findall(r"[a-zA-Z0-9]+", (text or "").lower())
+    return [w for w in words if len(w) > 2 and w not in stop]
+
+
+def row_matches_user(row: dict, user_message: str) -> bool:
+    """Keyword match one sheet row against the user's message."""
+    words = _keywords(user_message)
+    if not words:
+        return False
+    haystack = " ".join(str(v).lower() for v in (row or {}).values())
+    return any(w in haystack for w in words)
+
+
+def pick_relevant_rows(rows: list, user_message: str, matched_limit: int = 5, fallback_limit: int = 3) -> list:
+    """Use the full sheet in Python, but send only relevant rows to the LLM."""
+    rows = rows or []
+    matched = [r for r in rows if row_matches_user(r, user_message)]
+    return (matched[:matched_limit] if matched else rows[:fallback_limit])
+
+
+async def build_system_prompt(language: str, user_message: str = "") -> str:
+    """Build a small per-message prompt from the full sheet data.
+
+    This avoids sending the whole sheet to Groq on every message while still
+    allowing the backend to search the whole sheet with simple keywords.
+    """
     services = await get_all_services()
     faqs = await get_faqs(language)
     areas = await get_areas()
     projects = await get_projects()
     developers = await get_developers()
     plans = await get_payment_plans()
-    crawled = await get_crawled_properties()  # ✅ NEW
+    crawled = await get_crawled_properties()
+    company = await get_company_info()
 
-    svc = "\n".join(f"- {s['name']}: {s['price_range']} — {s['description']}" for s in services)
-    faq = "\n".join(f"Q: {f['question']}\nA: {f['answer']}" for f in faqs[:12])
-    area = "\n".join(f"- {a['name']}: AED {a['price']} psf, {a['yield']} yield — {a['best_for']}" for a in areas[:8])
-    proj = "\n".join(f"- {p['name']} by {p['developer']} in {p['location']}: from AED {p['price']}, {p['plan']}, handover {p['handover']}" for p in projects[:8])
-    dev = "\n".join(f"- {d['name']}: {d['known_for']}" for d in developers[:6])
-    plan = "\n".join(f"- {p['plan']}: {p['structure']} — {p['description']}" for p in plans[:5])
+    services_for_prompt = pick_relevant_rows(services, user_message, 5, 3)
+    faqs_for_prompt = pick_relevant_rows(faqs, user_message, 5, 3)
+    areas_for_prompt = pick_relevant_rows(areas, user_message, 5, 3)
+    projects_for_prompt = pick_relevant_rows(projects, user_message, 5, 3)
+    developers_for_prompt = pick_relevant_rows(developers, user_message, 4, 2)
+    plans_for_prompt = pick_relevant_rows(plans, user_message, 4, 2)
+    crawled_for_prompt = pick_relevant_rows(crawled, user_message, 4, 1)
 
-    # ✅ NEW: Crawled properties injected
+    svc = "\n".join(
+        f"- {_safe_get(s,'name')}: {_safe_get(s,'price_range')} — {_safe_get(s,'description')}"
+        for s in services_for_prompt
+    )
+    faq = "\n".join(
+        f"Q: {_safe_get(f,'question')}\nA: {_safe_get(f,'answer')}"
+        for f in faqs_for_prompt
+    )
+    area = "\n".join(
+        f"- {_safe_get(a,'name')}: AED {_safe_get(a,'price')} psf, {_safe_get(a,'yield')} yield — {_safe_get(a,'best_for')}"
+        for a in areas_for_prompt
+    )
+    proj = "\n".join(
+        f"- {_safe_get(p,'name')} by {_safe_get(p,'developer')} in {_safe_get(p,'location')}: from AED {_safe_get(p,'price')}, {_safe_get(p,'plan')}, handover {_safe_get(p,'handover')}"
+        for p in projects_for_prompt
+    )
+    dev = "\n".join(
+        f"- {_safe_get(d,'name')}: {_safe_get(d,'known_for')}"
+        for d in developers_for_prompt
+    )
+    plan = "\n".join(
+        f"- {_safe_get(p,'plan')}: {_safe_get(p,'structure')} — {_safe_get(p,'description')}"
+        for p in plans_for_prompt
+    )
     crawled_data = "\n".join(
-        f"- {p['name']} in {p['location']} by {p['developer']} ({p['type']}): {p['description']}"
-        for p in crawled[:10]
+        f"- {_safe_get(p,'name')} in {_safe_get(p,'location')} by {_safe_get(p,'developer')} ({_safe_get(p,'type')}): {_safe_get(p,'description')}"
+        for p in crawled_for_prompt
+    )
+
+    company_name = _safe_get(company, "company_name") or AGENCY
+    company_about = _safe_get(company, "about")[:900]
+    company_home = _safe_get(company, "home")[:700]
+    company_contact = _safe_get(company, "contact_info")[:400]
+
+    company_block = (
+        f"Name: {company_name}\n"
+        f"About: {company_about or AGENCY_CONTEXT}\n"
+        f"Website/Home: {company_home}\n"
+        f"Contact: {company_contact}"
     )
 
     data = (
-        f"### SERVICES\n{svc}\n\n"
-        f"### KEY AREAS\n{area}\n\n"
-        f"### OFF-PLAN PROJECTS\n{proj}\n\n"
-        f"### DEVELOPERS\n{dev}\n\n"
-        f"### PAYMENT PLANS\n{plan}\n\n"
-        f"### CRAWLED PROPERTIES\n{crawled_data}\n\n"  # ✅ NEW BLOCK
-        f"### FAQS\n{faq}"
+        f"### COMPANY IDENTITY\n{company_block}\n\n"
+        f"### AGENCY CONTEXT\n{AGENCY_CONTEXT}\n\n"
+        f"### RELEVANT SERVICES\n{svc}\n\n"
+        f"### RELEVANT KEY AREAS\n{area}\n\n"
+        f"### RELEVANT OFF-PLAN PROJECTS\n{proj}\n\n"
+        f"### RELEVANT DEVELOPERS\n{dev}\n\n"
+        f"### RELEVANT PAYMENT PLANS\n{plan}\n\n"
+        f"### RELEVANT CRAWLED PROPERTIES\n{crawled_data}\n\n"
+        f"### RELEVANT FAQS\n{faq}"
     )
 
     return SYSTEM_PROMPT.replace("{AGENCY}", AGENCY).replace("{DATA}", data)
@@ -307,16 +398,21 @@ def extract_contact_from_history(history: list) -> dict:
     name = ""
     ignored = {
         "yes", "sure", "ok", "okay", "hello", "hi", "rent", "buy", "invest",
-        "confirmation for what", "tomorrow", "today"
+        "confirmation for what", "tomorrow", "today", "tell me more", "more details",
+        "details", "book", "booking", "schedule", "viewing", "that's not my name",
+        "thats not my name", "not my name"
     }
     for msg in user_texts:
         clean = msg.strip()
         lowered = clean.lower()
         if not clean or lowered in ignored:
             continue
-        if "@" in clean or re.search(r"\d", clean) or looks_like_datetime(clean):
+        if "@" in clean or re.search(r"\d", clean) or looks_like_datetime(clean) or looks_like_non_name_reply(clean):
             continue
-        if len(clean.split()) <= 4 and len(clean) <= 40:
+        explicit = extract_explicit_name(clean)
+        if explicit:
+            name = explicit
+        elif len(clean.split()) <= 4 and len(clean) <= 40:
             name = clean
     return {
         "name": name,
@@ -325,10 +421,71 @@ def extract_contact_from_history(history: list) -> dict:
     }
 
 
+
+def extract_explicit_name(message: str) -> str:
+    """Extract names from phrases like 'my name is shahreen' even if we asked for email."""
+    msg = (message or "").strip()
+    patterns = [
+        r"\bmy name is\s+([A-Za-z][A-Za-z\s.'-]{1,40})",
+        r"\bi am\s+([A-Za-z][A-Za-z\s.'-]{1,40})",
+        r"\bi'm\s+([A-Za-z][A-Za-z\s.'-]{1,40})",
+        r"\bthis is\s+([A-Za-z][A-Za-z\s.'-]{1,40})",
+        r"\bname\s*[:\-]\s*([A-Za-z][A-Za-z\s.'-]{1,40})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, msg, re.I)
+        if m:
+            name = re.sub(r"\s+", " ", m.group(1)).strip(" .,-")
+            # Remove trailing conversational words if present
+            name = re.sub(r"\b(and|but|also|email|phone|number)\b.*$", "", name, flags=re.I).strip()
+            if 1 <= len(name.split()) <= 4 and len(name) <= 40:
+                return name
+    return ""
+
+
+def is_name_rejection(message: str) -> bool:
+    """Detect when user says the bot stored the wrong name."""
+    msg = (message or "").lower()
+    return any(p in msg for p in [
+        "not my name",
+        "that's not my name",
+        "that is not my name",
+        "wrong name",
+        "incorrect name",
+        "not name",
+    ])
+
+
+def looks_like_non_name_reply(message: str) -> bool:
+    """Avoid storing intent replies like 'tell me more' as a person's name."""
+    msg = (message or "").strip().lower()
+    bad_exact = {
+        "tell me more", "more details", "details", "yes", "no", "sure", "ok", "okay",
+        "book", "booking", "schedule", "viewing", "send details", "interested",
+        "i am interested", "not now", "later", "thats not my name", "that's not my name",
+    }
+    if msg in bad_exact:
+        return True
+    if "?" in msg:
+        return True
+    if any(x in msg for x in ["tell me", "more about", "details", "price", "payment", "available", "amenities"]):
+        return True
+    return False
+
 def update_lead_state_from_message(session: dict, user_message: str):
     """Store booking/contact details deterministically so the AI cannot lose them."""
     lead = session.setdefault("lead", {})
     msg = user_message.strip()
+
+    # If user corrects the assistant, clear the wrong stored name and ask again.
+    if is_name_rejection(msg):
+        lead.pop("name", None)
+        session.setdefault("asked_missing_fields", {}).pop("name", None)
+
+    # Explicit name phrases work even if the previous question was email/phone.
+    explicit_name = extract_explicit_name(msg)
+    if explicit_name:
+        lead["name"] = explicit_name
 
     # Email
     email_match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", msg)
@@ -409,9 +566,16 @@ def update_lead_state_from_message(session: dict, user_message: str):
             break
 
     if "name" in last_assistant and not lead.get("name"):
-        if msg and "@" not in msg and not re.search(r"\d", msg) and not looks_like_datetime(msg):
-            if len(msg.split()) <= 4 and len(msg) <= 40:
-                lead["name"] = msg
+        if (
+            msg
+            and "@" not in msg
+            and not re.search(r"\d", msg)
+            and not looks_like_datetime(msg)
+            and not looks_like_non_name_reply(msg)
+        ):
+            clean_name = re.sub(r"^(my name is|i am|i'm|this is)\s+", "", msg, flags=re.I).strip()
+            if len(clean_name.split()) <= 4 and len(clean_name) <= 40:
+                lead["name"] = clean_name
 
     return lead
 
@@ -456,54 +620,95 @@ def is_user_query(message: str) -> bool:
         or any(q in msg for q in question_keywords)
     )
     
+def _repeat_prefix(session: dict, field: str, language: str) -> str:
+    """Make repeated asks sound intentional instead of broken."""
+    asked = session.setdefault("asked_missing_fields", {})
+    asked[field] = asked.get(field, 0) + 1
+    if asked[field] <= 1:
+        return ""
+
+    if language == "ar":
+        labels = {
+            "viewing_datetime": "تاريخ ووقت المعاينة",
+            "viewing_time": "وقت المعاينة",
+            "viewing_date": "يوم المعاينة",
+            "name": "الاسم",
+            "email": "البريد الإلكتروني",
+            "phone": "رقم الهاتف",
+        }
+        return f"عذراً، لم ألتقط {labels.get(field, 'هذه المعلومة')} بوضوح. "
+
+    labels = {
+        "viewing_datetime": "the viewing date and time",
+        "viewing_time": "the viewing time",
+        "viewing_date": "the viewing day",
+        "name": "your name",
+        "email": "your email",
+        "phone": "your phone number",
+    }
+    return f"Sorry, I didn’t catch {labels.get(field, 'that detail')} clearly. "
+
+
 def next_missing_booking_question(session: dict, language: str):
-    """Ask the next missing booking question in a stable order."""
+    """Ask the next missing booking question in a stable order without sounding repetitive."""
     lead = session.get("lead", {})
 
     has_date = _valid_lead_value(lead.get("viewing_date"))
     has_time = _valid_lead_value(lead.get("viewing_time"))
 
     if not has_date and not has_time:
-        return (
+        field = "viewing_datetime"
+        question = (
             "What date and time would you prefer for the viewing?"
             if language == "en"
             else "ما التاريخ والوقت المناسبان للمعاينة؟"
         )
+        return _repeat_prefix(session, field, language) + question
 
     if has_date and not has_time:
-        return (
-            "Great. What time would you prefer for the viewing?"
+        field = "viewing_time"
+        question = (
+            "What time would you prefer for the viewing?"
             if language == "en"
-            else "رائع. ما الوقت المناسب للمعاينة؟"
+            else "ما الوقت المناسب للمعاينة؟"
         )
+        return _repeat_prefix(session, field, language) + question
 
     if has_time and not has_date:
-        return (
-            "Great. What day would you prefer for the viewing?"
+        field = "viewing_date"
+        question = (
+            "What day would you prefer for the viewing?"
             if language == "en"
-            else "رائع. ما اليوم المناسب للمعاينة؟"
+            else "ما اليوم المناسب للمعاينة؟"
         )
+        return _repeat_prefix(session, field, language) + question
 
     if not _valid_lead_value(lead.get("name")):
-        return (
-            "Great. What is your name?"
+        field = "name"
+        question = (
+            "What is your name?"
             if language == "en"
-            else "رائع. ما اسمك الكريم؟"
+            else "ما اسمك الكريم؟"
         )
+        return _repeat_prefix(session, field, language) + question
 
     if not _valid_lead_value(lead.get("email")):
-        return (
-            "Can we have your email to send the booking confirmation?"
+        field = "email"
+        question = (
+            "What email should we use for the booking confirmation?"
             if language == "en"
-            else "هل يمكننا الحصول على بريدك الإلكتروني لإرسال تأكيد الحجز؟"
+            else "ما البريد الإلكتروني المناسب لإرسال تأكيد الحجز؟"
         )
+        return _repeat_prefix(session, field, language) + question
 
     if not _valid_lead_value(lead.get("phone")):
-        return (
+        field = "phone"
+        question = (
             "What phone number should the agent contact you on?"
             if language == "en"
             else "ما رقم الهاتف الذي يمكن للوكيل التواصل معك عليه؟"
         )
+        return _repeat_prefix(session, field, language) + question
 
     return None
 
@@ -516,19 +721,19 @@ def fallback_missing_lead_question(session: dict, language: str) -> str:
     lead = session.get("lead", {})
 
     if not _valid_lead_value(lead.get("name")):
-        return (
+        return _repeat_prefix(session, "name", language) + (
             "Our team is currently busy and will contact you shortly. Kindly share your name."
             if language == "en"
             else "فريقنا مشغول حالياً وسيتواصل معك قريباً. يرجى إرسال الاسم."
         )
     if not _valid_lead_value(lead.get("email")):
-        return (
+        return _repeat_prefix(session, "email", language) + (
             "Thank you. Please share your email address."
             if language == "en"
             else "شكراً. يرجى إرسال البريد الإلكتروني."
         )
     if not _valid_lead_value(lead.get("phone")):
-        return (
+        return _repeat_prefix(session, "phone", language) + (
             "Please share your phone number so our team can contact you."
             if language == "en"
             else "يرجى إرسال رقم الهاتف حتى يتمكن فريقنا من التواصل معك."
@@ -596,13 +801,55 @@ def fallback_collect_and_book_response(session: dict, user_message: str, languag
     }
 
 
-def post_booking_fallback_reply(user_message: str, session: dict, language: str) -> str:
-    """Only used when LLM fails after a booking is already completed."""
+async def post_booking_fallback_reply(user_message: str, session: dict, language: str) -> str:
+    """Safe fallback after booking is completed.
+
+    Important: after booking, users may still ask normal questions. If Groq fails
+    or rate-limits, we still answer simple company/property questions instead of
+    repeating "your booking is confirmed".
+    """
     msg = (user_message or "").lower()
     lead = session.get("lead", {})
     interest = lead.get("interest") or "the selected property"
     vdate = lead.get("viewing_date") or "the confirmed date"
     vtime = lead.get("viewing_time") or "the confirmed time"
+
+    company = {}
+    try:
+        company = await get_company_info()
+    except Exception:
+        company = {}
+
+    company_name = _safe_get(company, "company_name") or AGENCY
+    company_about = _safe_get(company, "about") or AGENCY_CONTEXT
+    company_home = _safe_get(company, "home")
+    company_contact = _safe_get(company, "contact_info")
+
+    # Company identity questions
+    if any(x in msg for x in [
+        "company name", "your company", "agency name", "who are you",
+        "what is your name", "brokerage name", "which company"
+    ]):
+        if language == "ar":
+            return f"اسم الشركة هو {company_name}. نحن مساعد عقاري تابع لها، ونساعدك في اختيار العقارات وحجز المعاينات."
+        return f"Our company is {company_name}. I’m the property assistant for the brokerage, helping with property options, details, and viewing bookings."
+
+    # Company/about questions
+    if any(x in msg for x in ["about company", "about your company", "tell me about", "company about", "what do you do"]):
+        short_about = shorten(company_about, 35)
+        if language == "ar":
+            return f"{company_name} هي شركة وساطة عقارية في دبي. {short_about}"
+        return f"{company_name} is a Dubai real estate brokerage. {short_about}"
+
+    # Contact questions
+    if any(x in msg for x in ["contact", "phone", "email", "number", "call", "whatsapp"]):
+        if company_contact:
+            if language == "ar":
+                return f"يمكنك التواصل مع {company_name} عبر: {company_contact}"
+            return f"You can contact {company_name} here: {company_contact}"
+        if language == "ar":
+            return f"يمكن لفريق {company_name} التواصل معك قريباً لتأكيد التفاصيل."
+        return f"The {company_name} team can contact you shortly to confirm the details."
 
     if language == "ar":
         if any(w in msg for w in ["وين", "أين", "الموقع", "العنوان"]):
@@ -611,7 +858,7 @@ def post_booking_fallback_reply(user_message: str, session: dict, language: str)
             return f"المعاينة مؤكدة للعقار المطلوب: {interest}. سيشرح لك الوكيل التفاصيل الكاملة أثناء التواصل."
         if any(w in msg for w in ["وقت", "موعد", "تاريخ"]):
             return f"موعد المعاينة مؤكد بتاريخ {vdate} الساعة {vtime}. سيتواصل معك الوكيل قريباً."
-        return "تم تأكيد الحجز. يمكنك إرسال أي سؤال إضافي، وسيتواصل معك الوكيل قريباً بالتفاصيل."
+        return "تم تأكيد الحجز. يمكنك أيضاً سؤالي عن الشركة، العقار، المنطقة، الأسعار، أو الخطوات التالية."
 
     if any(w in msg for w in ["where", "location", "address", "directions"]):
         return "The exact viewing location and directions will be shared by the agent before the appointment."
@@ -621,7 +868,8 @@ def post_booking_fallback_reply(user_message: str, session: dict, language: str)
         return f"Your viewing is confirmed for {vdate} at {vtime}. The agent will contact you shortly."
     if any(w in msg for w in ["price", "cost", "payment", "plan", "budget"]):
         return "The agent will confirm the exact price, payment plan, and availability before your viewing."
-    return "Your booking is confirmed. You can ask anything about the property, area, pricing, or next steps."
+
+    return f"Your booking is confirmed. You can also ask me about {company_name}, the property, area, pricing, or next steps."
 
 
 async def handle_llm_failure(session: dict, user_message: str, language: str, source: str, error: Exception) -> dict:
@@ -636,14 +884,14 @@ async def handle_llm_failure(session: dict, user_message: str, language: str, so
     # IMPORTANT: After booking, do not restart booking flow and do not ask for details again.
     # This is only a temporary fallback for the failed LLM request.
     if session.get("booking_made"):
-        reply = post_booking_fallback_reply(user_message, session, language)
+        reply = await post_booking_fallback_reply(user_message, session, language)
         session["history"].append({"role": "user", "content": user_message})
         session["history"].append({"role": "assistant", "content": reply})
 
         save_chat_log(session.get("id"), user_message, reply)
         
-        if len(session["history"]) > 20:
-            session["history"] = session["history"][-20:]
+        if len(session["history"]) > 8:
+            session["history"] = session["history"][-8:]
         return {
             "reply": reply,
             "language": language,
@@ -673,8 +921,8 @@ async def handle_llm_failure(session: dict, user_message: str, language: str, so
 
     session["history"].append({"role": "user", "content": user_message})
     session["history"].append({"role": "assistant", "content": reply})
-    if len(session["history"]) > 20:
-        session["history"] = session["history"][-20:]
+    if len(session["history"]) > 8:
+        session["history"] = session["history"][-8:]
 
     return {
         "reply": reply,
@@ -826,6 +1074,7 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             "fallback_mode": False,
             "fallback_history": [],
             "lead": {},
+            "asked_missing_fields": {},
         }
 
     session = _sessions[session_id]
@@ -893,8 +1142,9 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             "booking_status": session.get("booking_status", {}),
         }
 
-    if session["system_prompt"] is None:
-        session["system_prompt"] = await build_system_prompt(language)
+    # Build a small, relevant prompt per message. Full sheet data remains in Python,
+    # but only matching rows are sent to Groq to reduce token usage.
+    session["system_prompt"] = await build_system_prompt(language, user_message)
 
     messages = [{"role": "system", "content": session["system_prompt"]}]
     messages += history_to_messages(session["history"])
@@ -951,8 +1201,8 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
     if session.get("booking_made"):
         session["history"].append({"role": "user", "content": user_message})
         session["history"].append({"role": "assistant", "content": reply or "Got it. How can I help you next?"})
-        if len(session["history"]) > 20:
-            session["history"] = session["history"][-20:]
+        if len(session["history"]) > 8:
+            session["history"] = session["history"][-8:]
         return {
             "reply": reply or "Got it. How can I help you next?",
             "language": language,
@@ -1006,8 +1256,8 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
 
     save_chat_log(session_id, user_message, reply)
 
-    if len(session["history"]) > 20:
-        session["history"] = session["history"][-20:]
+    if len(session["history"]) > 8:
+        session["history"] = session["history"][-8:]
 
     booking_for_response = booking if booking_made else None
 
