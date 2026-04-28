@@ -351,7 +351,7 @@ def fallback_extract_datetime_from_message(message: str):
         message,
         settings={
             "PREFER_DATES_FROM": "future",
-            "RELATIVE_BASE": datetime.now() + timedelta(hours=4),,
+            "RELATIVE_BASE": datetime.now() + timedelta(hours=4),
             "RETURN_AS_TIMEZONE_AWARE": False,
         },
     )
