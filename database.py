@@ -100,6 +100,30 @@ async def get_crawled_properties() -> list:
 
 
 
+async def get_company_info() -> dict:
+    """Read Zahra Signature Realty company identity crawled from website.
+
+Expected tab: company_info
+Columns: company_name, home_content, about_content, contact_info, last_updated
+"""
+    rows = await _fetch_tab("company_info")
+    if not rows:
+        return {
+            "company_name": os.getenv("AGENCY_NAME", "Zahra Signature Realty"),
+            "home": "",
+            "about": os.getenv("AGENCY_CONTEXT", "Dubai property brokerage focused on trusted, premium real estate guidance."),
+            "contact": "",
+        }
+
+    r = rows[0]
+    return {
+        "company_name": r.get("company_name", "").strip(),
+        "home": r.get("home_content", "").strip(),
+        "about": r.get("about_content", "").strip(),
+        "contact": r.get("contact_info", "").strip(),
+        "last_updated": r.get("last_updated", "").strip(),
+    }
+
 
 # ── Save lead to sheet (needs service account for writing) ────────────────────
 # For demo: prints to terminal + saves to in-memory store
