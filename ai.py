@@ -17,7 +17,11 @@ CACHE_TTL = 300  # 5 minutes
 client = OpenAI(api_key=os.getenv("GROQ_API_KEY"), base_url="https://api.groq.com/openai/v1")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 AGENT_NAME = os.getenv("AGENT_NAME", "Omar Hassan")
-AGENCY = os.getenv("AGENCY_NAME", "Elite Properties Dubai")
+AGENCY = os.getenv("AGENCY_NAME", "Elite Properties Dubai", "In a city built on ambition and inspired by dreams, Zahra Signature Realty was founded with a clear purpose to redefine real estate through trust, innovation, and the human touch. inspired by the visionary leadership of His Highness Sheikh Mohammed bin Rashid Al Maktoum, whose vision made Dubai a global capital of ambition and innovation.
+
+"I founded this company to contribute to Dubai’s growth, not as a follower, but as a creator — delivering signature experiences to every client and respect and recognition to the agents who make it all possible.
+
+"At ZSR, real estate isn’t just about transactions – it’s about trust, transformation, and lasting impact. Create experiences clients will never forget, celebrate agents as heros and shape a culture of contribution, excellence, and integrity.")
 
 SYSTEM_PROMPT = """You are a professional real estate assistant for {AGENCY}, a Dubai property brokerage.
 
@@ -100,6 +104,22 @@ FALLBACK_AR = """اجمع الاسم والبريد والهاتف وتاريخ 
 حد أقصى 20 كلمة. أخرج كتلة BOOKING عند اكتمال البيانات."""
 
 _sessions: dict = {}
+SESSION_TTL_SECONDS = 60 * 60  # auto-clean old demo sessions after 1 hour
+
+
+def cleanup_old_demo_sessions() -> None:
+    """Prevent old browser demo sessions from living forever in memory."""
+    now = datetime.utcnow()
+    expired = []
+    for sid, sess in list(_sessions.items()):
+        if not str(sid).startswith("demo_"):
+            continue
+        last_seen = sess.get("last_seen") or sess.get("window_start") or now
+        if (now - last_seen).total_seconds() > SESSION_TTL_SECONDS:
+            expired.append(sid)
+    for sid in expired:
+        _sessions.pop(sid, None)
+
 
 
 def detect_language(text: str) -> str:
@@ -790,6 +810,14 @@ def make_cache_key(session_id: str, message: str) -> str:
 async def get_ai_response(session_id: str, user_message: str, source: str = "website") -> dict:
     language = detect_language(user_message)
 
+    # The frontend now sends a new demo_* session_id on every refresh.
+    # This cleanup keeps Railway memory clean and prevents old demo states from
+    # accidentally being reused if a stale tab sends an old id.
+    cleanup_old_demo_sessions()
+
+    if not session_id:
+        session_id = f"demo_backend_{int(time.time())}_{md5(user_message.encode()).hexdigest()[:8]}"
+
     if session_id not in _sessions:
         _sessions[session_id] = {
             "id": session_id,
@@ -798,12 +826,14 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             "booking_made": False,
             "msg_count": 0,
             "window_start": datetime.utcnow(),
+            "last_seen": datetime.utcnow(),
             "fallback_mode": False,
             "fallback_history": [],
             "lead": {},
         }
 
     session = _sessions[session_id]
+    session["last_seen"] = datetime.utcnow()
 
     cache_key = make_cache_key(session_id, user_message)
 
@@ -817,9 +847,12 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
         session.get("booking_made"),
     ])
 
+    is_demo_session = str(session_id).startswith("demo_") or source == "demo"
+
     # Check cache only for simple/general queries.
+    # Demo sessions skip cache so every refresh feels like a fresh live conversation.
     # Do not cache lead-capture or booking-flow messages.
-    if not is_booking_flow:
+    if not is_booking_flow and not is_demo_session:
         cached = CACHE.get(cache_key)
         if cached:
             if time.time() - cached["time"] < CACHE_TTL:
@@ -999,7 +1032,7 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
     }
 
     # Save only simple, non-booking responses to cache.
-    if not is_booking_flow and not booking_made:
+    if not is_booking_flow and not booking_made and not is_demo_session:
         CACHE[cache_key] = {
             "response": result,
             "time": time.time(),
