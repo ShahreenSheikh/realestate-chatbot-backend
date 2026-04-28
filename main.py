@@ -14,7 +14,7 @@ from ai import get_ai_response
 from whatsapp import verify_webhook, parse_incoming, _send as wa_send
 from followup import run_followups
 
-app = FastAPI(title="Elite Properties Dubai — AI Chatbot", version="1.0.0")
+app = FastAPI(title="Zahra Signature Realty — AI Chatbot", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -65,7 +65,7 @@ async def stop_scheduler():
 def root():
     return {
         "status":  "ok",
-        "service": "Elite Properties Dubai — AI Chatbot",
+        "service": "Zahra Signature Realty — AI Chatbot",
         "agent":   os.getenv("AGENT_NAME", "Omar Hassan"),
     }
 
