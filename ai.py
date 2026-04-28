@@ -146,7 +146,7 @@ def is_placeholder(value: str) -> bool:
 
 def _safe_get(row: dict, key: str, default: str = "") -> str:
     """Read sheet fields safely even if a column is missing."""
-    return str((row or {}).get(key, default) or "").strip()
+    return str((row or {}).get(key, default) or "").strip()[:300]
 
 
 def _keywords(text: str) -> list:
@@ -192,13 +192,13 @@ async def build_system_prompt(language: str, user_message: str = "") -> str:
     crawled = await get_crawled_properties()
     company = await get_company_info()
 
-    services_for_prompt = pick_relevant_rows(services, user_message, 5, 3)
-    faqs_for_prompt = pick_relevant_rows(faqs, user_message, 5, 3)
-    areas_for_prompt = pick_relevant_rows(areas, user_message, 5, 3)
-    projects_for_prompt = pick_relevant_rows(projects, user_message, 5, 3)
-    developers_for_prompt = pick_relevant_rows(developers, user_message, 4, 2)
-    plans_for_prompt = pick_relevant_rows(plans, user_message, 4, 2)
-    crawled_for_prompt = pick_relevant_rows(crawled, user_message, 4, 1)
+    services_for_prompt = pick_relevant_rows(services, user_message, 3, 2)
+    faqs_for_prompt = pick_relevant_rows(faqs, user_message, 3, 1)
+    areas_for_prompt = pick_relevant_rows(areas, user_message, 3, 2)
+    projects_for_prompt = pick_relevant_rows(projects, user_message, 3, 2)
+    developers_for_prompt = pick_relevant_rows(developers, user_message, 2, 1)
+    plans_for_prompt = pick_relevant_rows(plans, user_message, 2, 1)
+    crawled_for_prompt = pick_relevant_rows(crawled, user_message, 3, 1)
 
     svc = "\n".join(
         f"- {_safe_get(s,'name')}: {_safe_get(s,'price_range')} — {_safe_get(s,'description')}"
@@ -230,9 +230,9 @@ async def build_system_prompt(language: str, user_message: str = "") -> str:
     )
 
     company_name = _safe_get(company, "company_name") or AGENCY
-    company_about = _safe_get(company, "about")[:900]
-    company_home = _safe_get(company, "home")[:700]
-    company_contact = _safe_get(company, "contact_info")[:400]
+    company_about = _safe_get(company, "about")[:350]
+    company_home = _safe_get(company, "home")[:250]
+    company_contact = _safe_get(company, "contact_info")[:180]
 
     company_block = (
         f"Name: {company_name}\n"
@@ -282,13 +282,13 @@ def shorten(text: str, max_w: int = 50) -> str:
 
 
 def history_to_messages(history: list) -> list:
-    return [{"role": m["role"], "content": m.get("content", "")} for m in history]
+    return [{"role": m["role"], "content": m.get("content", "")} for m in history[-4:]]
 
 
 def build_history_text(history: list) -> str:
     lines = [
         f"{'User' if m['role']=='user' else 'Assistant'}: {m.get('content','')}"
-        for m in history[-6:]
+        for m in history[-4:]
     ]
     return "\n".join(lines) or "No prior conversation."
 
@@ -377,7 +377,7 @@ def normalize_booking_datetime(booking: dict) -> dict:
         combined,
         settings={
             "PREFER_DATES_FROM": "future",
-            "RELATIVE_BASE": datetime.now(),
+            "RELATIVE_BASE": datetime.now() + timedelta(hours=4),
             "RETURN_AS_TIMEZONE_AWARE": False,
         },
     )
@@ -1144,7 +1144,14 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
 
     # Build a small, relevant prompt per message. Full sheet data remains in Python,
     # but only matching rows are sent to Groq to reduce token usage.
-    session["system_prompt"] = await build_system_prompt(language, user_message)
+    retrieval_query = " ".join(
+        [user_message] + [
+            m.get("content", "")
+            for m in session.get("history", [])[-4:]
+            if m.get("role") == "user"
+        ]
+    )
+    session["system_prompt"] = await build_system_prompt(language, retrieval_query)
 
     messages = [{"role": "system", "content": session["system_prompt"]}]
     messages += history_to_messages(session["history"])
@@ -1173,7 +1180,7 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             model=GROQ_MODEL,
             messages=messages,
             temperature=0.2,
-            max_tokens=150,
+            max_tokens=90,
         )
         raw = response.choices[0].message.content
     except Exception as e:
