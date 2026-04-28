@@ -17,11 +17,7 @@ CACHE_TTL = 300  # 5 minutes
 client = OpenAI(api_key=os.getenv("GROQ_API_KEY"), base_url="https://api.groq.com/openai/v1")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 AGENT_NAME = os.getenv("AGENT_NAME", "Omar Hassan")
-AGENCY = os.getenv("AGENCY_NAME", "Zahra Signature Realty", "In a city built on ambition and inspired by dreams, Zahra Signature Realty was founded with a clear purpose to redefine real estate through trust, innovation, and the human touch. inspired by the visionary leadership of His Highness Sheikh Mohammed bin Rashid Al Maktoum, whose vision made Dubai a global capital of ambition and innovation.
-
-"I founded this company to contribute to Dubai’s growth, not as a follower, but as a creator — delivering signature experiences to every client and respect and recognition to the agents who make it all possible.
-
-"At ZSR, real estate isn’t just about transactions – it’s about trust, transformation, and lasting impact. Create experiences clients will never forget, celebrate agents as heros and shape a culture of contribution, excellence, and integrity.")
+AGENCY = os.getenv("AGENCY_NAME", "Zahra Signature Realty", "In a city built on ambition and inspired by dreams, Zahra Signature Realty was founded with a clear purpose to redefine real estate through trust, innovation, and the human touch. inspired by the visionary leadership of His Highness Sheikh Mohammed bin Rashid Al Maktoum, whose vision made Dubai a global capital of ambition and innovation.I founded this company to contribute to Dubai’s growth, not as a follower, but as a creator — delivering signature experiences to every client and respect and recognition to the agents who make it all possible.At ZSR, real estate isn’t just about transactions – it’s about trust, transformation, and lasting impact. Create experiences clients will never forget, celebrate agents as heros and shape a culture of contribution, excellence, and integrity.")
 
 SYSTEM_PROMPT = """You are a professional real estate assistant for {AGENCY}, a Dubai property brokerage.
 
