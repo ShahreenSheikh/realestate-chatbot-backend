@@ -80,8 +80,10 @@ You are knowledgeable, concise, and trustworthy.
    - Example: “Based on your budget and preference for sea-view living, Dubai Marina has several luxury options that fit well.”
 
 6. ONLY move to booking AFTER:
-   - user clearly shows interest
-   - OR asks to schedule
+   - user clearly shows interest in scheduling
+   - OR asks to schedule/book a viewing
+   - If the user only asks about features, views, amenities, location, ROI, price, or property details, answer normally.
+   - Do NOT ask for viewing date/time until the user confirms they want to schedule a viewing.
 
 7. NEVER rush to ask for name/email before giving value
 8. After a booking is confirmed, continue answering the user's questions normally.
@@ -452,6 +454,7 @@ def extract_contact_from_history(history: list) -> dict:
     name = ""
     ignored = {
         "yes", "sure", "ok", "okay", "hello", "hi", "rent", "buy", "invest",
+        "tomorrow at 10am", "tomorrow at 10 am", "today at 10am", "today at 10 am",
         "confirmation for what", "tomorrow", "today", "tell me more", "more details",
         "details", "book", "booking", "schedule", "viewing", "that's not my name",
         "thats not my name", "not my name"
@@ -707,6 +710,35 @@ def is_user_query(message: str) -> bool:
         "?" in msg
         or any(q in msg for q in question_keywords)
     )
+
+def booking_required_fields_ready(session: dict) -> bool:
+    """True only when a real booking can be processed."""
+    lead = session.get("lead", {})
+    return all(
+        _valid_lead_value(lead.get(k))
+        for k in ["viewing_date", "viewing_time", "name", "email", "phone"]
+    )
+
+
+def user_requested_booking(message: str) -> bool:
+    """Detect clear user intent to schedule/book, not just asking property details."""
+    msg = (message or "").lower().strip()
+    booking_phrases = [
+        "book", "schedule", "viewing", "view it", "see it", "visit",
+        "arrange", "appointment", "showing", "tour", "lets view",
+        "let's view", "i want to view", "can i view", "make booking",
+        "set up", "reserve", "confirm viewing"
+    ]
+    positive_short = {"yes", "sure", "ok", "okay", "go ahead", "yes please", "book it", "schedule it"}
+    return msg in positive_short or any(p in msg for p in booking_phrases)
+
+
+def booking_started(session: dict) -> bool:
+    """Booking collection starts only after a viewing date/time or contact detail exists."""
+    lead = session.get("lead", {})
+    return any(_valid_lead_value(lead.get(k)) for k in ["viewing_date", "viewing_time", "name", "email", "phone"])
+
+
     
 def _repeat_prefix(session: dict, field: str, language: str) -> str:
     """Make repeated asks sound intentional instead of broken."""
@@ -774,7 +806,7 @@ def next_missing_booking_question(session: dict, language: str):
     if not _valid_lead_value(lead.get("name")):
         field = "name"
         question = (
-            "What is your name?"
+            "Perfect, I can arrange that viewing. What name should I use for the booking?"
             if language == "en"
             else "ما اسمك الكريم؟"
         )
@@ -993,6 +1025,10 @@ async def handle_llm_failure(session: dict, user_message: str, language: str, so
             "interest": session.get("lead", {}).get("interest"),
             "budget": session.get("lead", {}).get("budget"),
             "area": session.get("lead", {}).get("area"),
+            "property_type": session.get("lead", {}).get("property_type"),
+            "bedrooms": session.get("lead", {}).get("bedrooms"),
+            "purpose": session.get("lead", {}).get("purpose"),
+            "timeline": session.get("lead", {}).get("timeline"),
             "booking_status": session.get("booking_status", {}),
             "fallback_mode": True,
         }
@@ -1025,6 +1061,10 @@ async def handle_llm_failure(session: dict, user_message: str, language: str, so
         "interest": booking.get("interest") if booking else session.get("lead", {}).get("interest"),
         "budget": booking.get("budget") if booking else session.get("lead", {}).get("budget"),
         "area": booking.get("area") if booking else session.get("lead", {}).get("area"),
+        "property_type": booking.get("property_type") if booking else session.get("lead", {}).get("property_type"),
+        "bedrooms": booking.get("bedrooms") if booking else session.get("lead", {}).get("bedrooms"),
+        "purpose": booking.get("purpose") if booking else session.get("lead", {}).get("purpose"),
+        "timeline": booking.get("timeline") if booking else session.get("lead", {}).get("timeline"),
         "booking_status": session.get("booking_status", {}),
         "fallback_mode": True,
     }
@@ -1200,6 +1240,48 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
 
     lead_state = update_lead_state_from_message(session, user_message)
 
+    # If the client gave a viewing date/time before contact details,
+    # NEVER confirm booking yet. Collect name, email, and phone first.
+    if (
+        not session.get("booking_made")
+        and (
+            _valid_lead_value(session.get("lead", {}).get("viewing_date"))
+            or _valid_lead_value(session.get("lead", {}).get("viewing_time"))
+        )
+        and not booking_required_fields_ready(session)
+    ):
+        q = next_missing_booking_question(session, language)
+        reply = q or (
+            "Perfect, I can arrange that viewing. What name should I use for the booking?"
+            if language == "en"
+            else "تمام، يمكنني ترتيب المعاينة. ما الاسم الذي أستخدمه للحجز؟"
+        )
+        session["history"].append({"role": "user", "content": user_message})
+        session["history"].append({"role": "assistant", "content": reply})
+        if len(session["history"]) > 8:
+            session["history"] = session["history"][-8:]
+        save_chat_log(session_id, user_message, reply)
+        return {
+            "reply": reply,
+            "language": language,
+            "lead_captured": False,
+            "booking_made": False,
+            "viewing_date": session.get("lead", {}).get("viewing_date"),
+            "viewing_time": session.get("lead", {}).get("viewing_time"),
+            "name": session.get("lead", {}).get("name"),
+            "email": session.get("lead", {}).get("email"),
+            "phone": session.get("lead", {}).get("phone"),
+            "interest": session.get("lead", {}).get("interest"),
+            "budget": session.get("lead", {}).get("budget"),
+            "area": session.get("lead", {}).get("area"),
+            "property_type": session.get("lead", {}).get("property_type"),
+            "bedrooms": session.get("lead", {}).get("bedrooms"),
+            "purpose": session.get("lead", {}).get("purpose"),
+            "timeline": session.get("lead", {}).get("timeline"),
+            "booking_status": session.get("booking_status", {}),
+        }
+
+
     now = datetime.utcnow()
     if now - session["window_start"] > timedelta(hours=1):
         session["msg_count"] = 0
@@ -1213,7 +1295,7 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
 
     # If we already have all details, book immediately before asking the AI again.
     booking = maybe_build_booking_from_state(session, language)
-    if booking and not session["booking_made"]:
+    if booking and not session["booking_made"] and booking_required_fields_ready(session):
         await _process_booking(booking, session, language, source)
         reply = f"Confirmed. Your viewing is scheduled for {booking.get('viewing_date')} at {booking.get('viewing_time')}. Our agent will contact you shortly."
         session["history"].append({"role": "user", "content": user_message})
@@ -1231,6 +1313,10 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             "interest": booking.get("interest"),
             "budget": booking.get("budget"),
             "area": booking.get("area"),
+            "property_type": booking.get("property_type"),
+            "bedrooms": booking.get("bedrooms"),
+            "purpose": booking.get("purpose"),
+            "timeline": booking.get("timeline"),
             "booking_status": session.get("booking_status", {}),
         }
 
@@ -1294,7 +1380,9 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
     if is_user_query(user_message):
         ai_reply = reply  # AI answer first
 
-        next_q = next_missing_booking_question(session, language)
+        # Only continue booking questions after booking collection has started.
+        # This prevents feature questions like "sea facing?" from triggering date/time requests.
+        next_q = next_missing_booking_question(session, language) if booking_started(session) else None
 
         if next_q:
             reply = f"{ai_reply}\n\n{next_q}"
@@ -1320,6 +1408,10 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             "interest": session.get("lead", {}).get("interest"),
             "budget": session.get("lead", {}).get("budget"),
             "area": session.get("lead", {}).get("area"),
+            "property_type": session.get("lead", {}).get("property_type"),
+            "bedrooms": session.get("lead", {}).get("bedrooms"),
+            "purpose": session.get("lead", {}).get("purpose"),
+            "timeline": session.get("lead", {}).get("timeline"),
             "booking_status": session.get("booking_status", {}),
         }
 
@@ -1341,16 +1433,22 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             if booking.get(k):
                 session_lead[k] = booking.get(k)
 
-        required_ready = all(_valid_lead_value(session_lead.get(k)) for k in ["viewing_date", "viewing_time", "name", "email", "phone"])
+        required_ready = booking_required_fields_ready(session)
         if required_ready:
             booking = maybe_build_booking_from_state(session, language) or booking
             await _process_booking(booking, session, language, source)
             reply = f"Confirmed. Your viewing is scheduled for {booking.get('viewing_date')} at {booking.get('viewing_time')}. Our agent will contact you shortly."
             booking_made = True
         else:
+            # Hard stop: never process or expose a fake booking with missing contact details.
+            booking = None
             booking_made = False
             q = next_missing_booking_question(session, language)
-            reply = q or reply
+            reply = q or (
+                "Perfect, I can arrange that viewing. What name should I use for the booking?"
+                if language == "en"
+                else "تمام، يمكنني ترتيب المعاينة. ما الاسم الذي أستخدمه للحجز؟"
+            )
     else:
         booking_made = False
         
@@ -1378,6 +1476,10 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
         "interest": booking_for_response.get("interest") if booking_for_response else session.get("lead", {}).get("interest"),
         "budget": booking_for_response.get("budget") if booking_for_response else session.get("lead", {}).get("budget"),
         "area": booking_for_response.get("area") if booking_for_response else session.get("lead", {}).get("area"),
+        "property_type": booking_for_response.get("property_type") if booking_for_response else session.get("lead", {}).get("property_type"),
+        "bedrooms": booking_for_response.get("bedrooms") if booking_for_response else session.get("lead", {}).get("bedrooms"),
+        "purpose": booking_for_response.get("purpose") if booking_for_response else session.get("lead", {}).get("purpose"),
+        "timeline": booking_for_response.get("timeline") if booking_for_response else session.get("lead", {}).get("timeline"),
         "booking_status": session.get("booking_status", {}),
     }
 
