@@ -40,13 +40,26 @@ You are knowledgeable, concise, and trustworthy.
 
 ## CONVERSATION FLOW
 1. Greet briefly and ask what they are looking for: buying, renting, investing, or off-plan.
-2. Ask key qualifying questions ONE AT A TIME:
+2. Ask key qualifying questions ONE AT A TIME ONLY IF MISSING:
    - Property type if unknown
    - Preferred area if unknown
    - Budget if unknown
    - Timeline if unknown
+   - Purpose if unknown (investment or personal use)
+   - Bedroom count if relevant and unknown
+
 3. When recommending a property:
-   - ALWAYS give 2–3 relevant options (not just one)
+   - ALWAYS stay consistent with the user's latest confirmed preferences.
+   - NEVER switch areas unless the user explicitly agrees.
+   - NEVER ask again for area, budget, property type, bedroom count, purpose, or timeline if already confirmed.
+   - If the user changes an area or preference, immediately update recommendations to match the latest preference.
+   - Recommendations must match area, property type, bedroom count, budget, timeline, and lifestyle preference where available.
+   - Never recommend unrelated areas.
+   - Behave like a premium Dubai real estate consultant, not a form collector.
+   - Sea view → prioritize Dubai Marina, JBR, Bluewaters, Palm Jumeirah, and Emaar Beachfront if available.
+   - Family lifestyle → prioritize Dubai Hills, Arabian Ranches, and family communities if available.
+   - Investment → prioritize Business Bay, Downtown, JVC, and high-yield areas if available.
+   - ALWAYS give 2–3 relevant options when data is available (not just one).
    - Mention:
      • property type (apartment, villa, townhouse)
      • location
@@ -59,8 +72,12 @@ You are knowledgeable, concise, and trustworthy.
    - lifestyle (luxury, family-friendly, investment, waterfront, etc.)
 
 5. Make it feel like a real agent:
+   - summarize confirmed preferences naturally.
+   - guide the client confidently.
+   - avoid robotic questioning.
    - highlight benefits (ROI, location advantage, lifestyle)
-   - keep it short but valuable
+   - keep it short but valuable.
+   - Example: “Based on your budget and preference for sea-view living, Dubai Marina has several luxury options that fit well.”
 
 6. ONLY move to booking AFTER:
    - user clearly shows interest
@@ -291,6 +308,43 @@ def build_history_text(history: list) -> str:
         for m in history[-4:]
     ]
     return "\n".join(lines) or "No prior conversation."
+
+
+def build_lead_context(lead: dict) -> str:
+    """Give the LLM a compact memory lock so it stops repeating questions or switching preferences."""
+    if not lead:
+        return ""
+
+    labels = {
+        "interest": "Interest",
+        "area": "Area",
+        "budget": "Budget",
+        "property_type": "Property type",
+        "bedrooms": "Bedrooms",
+        "purpose": "Purpose",
+        "timeline": "Timeline",
+        "view_preference": "View preference",
+        "viewing_date": "Viewing date",
+        "viewing_time": "Viewing time",
+        "name": "Client name",
+        "email": "Email",
+        "phone": "Phone",
+    }
+    lines = []
+    for key, label in labels.items():
+        val = lead.get(key)
+        if _valid_lead_value(val):
+            lines.append(f"- {label}: {val}")
+
+    if not lines:
+        return ""
+
+    return (
+        "## CONFIRMED USER PREFERENCES — MEMORY LOCK\n"
+        + "\n".join(lines)
+        + "\nRules: Do not ask for these again. Keep recommendations aligned with these preferences. "
+        + "Do not switch area, budget, bedroom count, or purpose unless the user clearly changes them."
+    )
 
 
 def looks_like_datetime(message: str) -> bool:
@@ -524,9 +578,39 @@ def update_lead_state_from_message(session: dict, user_message: str):
                 lead["raw_datetime"] = dt["raw_datetime"]
 
     # Budget
-    budget_match = re.search(r"\b(?:aed\s*)?\d+(?:\.\d+)?\s*(?:k|K|m|M|million|aed|dirham|dirhams|usd|\$)?\b", msg)
-    if budget_match and re.search(r"\b(budget|aed|dirham|dirhams|million|\d+\s*[kKmM])\b", msg, re.I):
+    budget_match = re.search(r"\b(?:aed\s*)?\d+(?:\.\d+)?\s*(?:k|K|m|M|mil|MIL|mn|MN|million|aed|dirham|dirhams|usd|\$)?\b", msg)
+    if budget_match and re.search(r"\b(budget|aed|dirham|dirhams|million|mil|mn|\d+\s*(?:k|K|m|M|mil|MIL|mn|MN))\b", msg, re.I):
         lead["budget"] = budget_match.group(0).strip()
+
+    # Bedroom extraction: stores inputs like "1 bedroom", "2 bed", "3br", "studio".
+    lowered_msg = msg.lower()
+    bedroom_match = re.search(r"\b(\d+)\s*(?:bed|beds|bedroom|bedrooms|br)\b", lowered_msg)
+    if bedroom_match:
+        lead["bedrooms"] = bedroom_match.group(1)
+    elif re.search(r"\bstudio\b", lowered_msg):
+        lead["bedrooms"] = "Studio"
+
+    # Property type extraction
+    if re.search(r"\bapartment|flat\b", lowered_msg):
+        lead["property_type"] = "Apartment"
+    elif re.search(r"\bvilla\b", lowered_msg):
+        lead["property_type"] = "Villa"
+    elif re.search(r"\btownhouse|town house\b", lowered_msg):
+        lead["property_type"] = "Townhouse"
+
+    # Purpose extraction
+    if re.search(r"\bpersonal|end use|end-use|live in|move in|own use\b", lowered_msg):
+        lead["purpose"] = "Personal use"
+    elif re.search(r"\binvest|investment|roi|rental yield|yield\b", lowered_msg):
+        lead["purpose"] = "Investment"
+
+    # Lifestyle/view preference extraction
+    if re.search(r"\bsea view|seaview|waterfront|marina view|beach view|ocean view\b", lowered_msg):
+        lead["view_preference"] = "Sea view"
+
+    # Timeline extraction - do NOT treat this as a viewing appointment date.
+    if re.search(r"\bimmediately|asap|ready now|move now|this month|soon\b", lowered_msg):
+        lead["timeline"] = "Immediate"
 
     # Area extraction
     areas = [
@@ -599,6 +683,10 @@ def maybe_build_booking_from_state(session: dict, language: str):
             "interest": lead.get("interest") or "Dubai Property Viewing",
             "budget": lead.get("budget", ""),
             "area": lead.get("area", ""),
+            "property_type": lead.get("property_type", ""),
+            "bedrooms": lead.get("bedrooms", ""),
+            "purpose": lead.get("purpose", ""),
+            "timeline": lead.get("timeline", ""),
             "viewing_date": lead.get("viewing_date"),
             "viewing_time": lead.get("viewing_time"),
             "language": language,
@@ -983,6 +1071,10 @@ async def _process_booking(booking: dict, session: dict, language: str, source: 
         "interest": booking.get("interest"),
         "budget": booking.get("budget"),
         "area": booking.get("area"),
+        "property_type": booking.get("property_type"),
+        "bedrooms": booking.get("bedrooms"),
+        "purpose": booking.get("purpose"),
+        "timeline": booking.get("timeline"),
         "viewing_date": booking.get("viewing_date"),
         "viewing_time": booking.get("viewing_time"),
     })
@@ -1154,6 +1246,11 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
     session["system_prompt"] = await build_system_prompt(language, retrieval_query)
 
     messages = [{"role": "system", "content": session["system_prompt"]}]
+
+    lead_context = build_lead_context(session.get("lead", {}))
+    if lead_context:
+        messages.append({"role": "system", "content": lead_context})
+
     messages += history_to_messages(session["history"])
 
     lead_now = session.get("lead", {})
@@ -1234,13 +1331,13 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
         booking = normalize_booking_datetime(booking)
         # Merge any deterministic state that the LLM missed
         state = session.get("lead", {})
-        for k in ["name", "email", "phone", "interest", "budget", "area", "viewing_date", "viewing_time"]:
+        for k in ["name", "email", "phone", "interest", "budget", "area", "property_type", "bedrooms", "purpose", "timeline", "viewing_date", "viewing_time"]:
             if state.get(k) and not booking.get(k):
                 booking[k] = state[k]
 
         # Do not process a booking until required contact details exist.
         session_lead = session.setdefault("lead", {})
-        for k in ["name", "email", "phone", "interest", "budget", "area", "viewing_date", "viewing_time"]:
+        for k in ["name", "email", "phone", "interest", "budget", "area", "property_type", "bedrooms", "purpose", "timeline", "viewing_date", "viewing_time"]:
             if booking.get(k):
                 session_lead[k] = booking.get(k)
 
