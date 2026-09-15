@@ -608,7 +608,7 @@ def update_lead_state_from_message(session: dict, user_message: str):
         lead["property_type"] = "Townhouse"
 
     # Purpose extraction
-    if re.search(r"\bpersonal|end use|end-use|live in|move in|own use\b", lowered_msg):
+    if re.search(r"\b(personal|end use|end-use|live in|move in|own use|own|myself|for me|family use)\b", lowered_msg):
         lead["purpose"] = "Personal use"
     elif re.search(r"\binvest|investment|roi|rental yield|yield\b", lowered_msg):
         lead["purpose"] = "Investment"
@@ -716,6 +716,109 @@ def is_user_query(message: str) -> bool:
         "?" in msg
         or any(q in msg for q in question_keywords)
     )
+
+
+
+def _parse_budget_aed(value: str):
+    """Best-effort conversion of values like '20 mil', '2.5m', '750k' to AED."""
+    if not value:
+        return None
+    text = str(value).lower().replace(",", "").strip()
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(k|m|mil|mn|million)?", text)
+    if not m:
+        return None
+    amount = float(m.group(1))
+    unit = (m.group(2) or "").lower()
+    if unit == "k":
+        amount *= 1_000
+    elif unit in {"m", "mil", "mn", "million"}:
+        amount *= 1_000_000
+    return amount
+
+
+def _row_price_aed(row: dict):
+    for key in ("price", "starting_price", "price_from", "starting price"):
+        raw = _safe_get(row, key)
+        if raw:
+            parsed = _parse_budget_aed(raw)
+            if parsed:
+                return parsed
+    return None
+
+
+def _recommendation_score(row: dict, lead: dict) -> int:
+    hay = " ".join(str(v or "").lower() for v in (row or {}).values())
+    score = 0
+    area = str(lead.get("area") or "").lower()
+    ptype = str(lead.get("property_type") or "").lower()
+    beds = str(lead.get("bedrooms") or "").lower()
+    purpose = str(lead.get("purpose") or "").lower()
+    if area and area in hay:
+        score += 12
+    if ptype and ptype in hay:
+        score += 5
+    if beds and (f"{beds} bed" in hay or f"{beds}br" in hay or f"{beds} bedroom" in hay):
+        score += 6
+    if "investment" in purpose and any(x in hay for x in ("yield", "roi", "invest")):
+        score += 2
+    budget = _parse_budget_aed(lead.get("budget"))
+    price = _row_price_aed(row)
+    if budget and price:
+        if price <= budget:
+            score += 5
+        else:
+            score -= 8
+    return score
+
+
+async def build_matching_options_reply(session: dict, language: str) -> str:
+    """Build the recommendation stage from database rows so the model cannot skip the actual options."""
+    lead = session.get("lead", {})
+    projects = await get_projects() or []
+    crawled = await get_crawled_properties() or []
+    rows = projects + crawled
+    ranked = sorted(rows, key=lambda r: _recommendation_score(r, lead), reverse=True)
+    ranked = [r for r in ranked if _recommendation_score(r, lead) > 0][:3]
+
+    if not ranked:
+        if language == "ar":
+            return "لدي متطلباتك الآن، لكن لا توجد خيارات مطابقة كافية في بيانات العقارات الحالية. هل ترغب أن أطلب من مستشار عقاري البحث عن خيارات مناسبة لك؟"
+        return "I have your requirements, but I don't have enough matching listings in the current property data to present real options. Would you like a property specialist to find suitable matches for you?"
+
+    session["recommended_options"] = []
+    lines = []
+    for i, row in enumerate(ranked, 1):
+        name = _safe_get(row, "name") or _safe_get(row, "project") or f"Option {i}"
+        location = _safe_get(row, "location") or lead.get("area", "")
+        developer = _safe_get(row, "developer")
+        ptype = _safe_get(row, "type") or lead.get("property_type", "")
+        price = _safe_get(row, "price") or _safe_get(row, "starting_price") or _safe_get(row, "price_from")
+        plan = _safe_get(row, "plan") or _safe_get(row, "payment_plan")
+        desc = _safe_get(row, "description")
+        session["recommended_options"].append({"index": i, "name": name, "row": row})
+        bits = []
+        if developer:
+            bits.append(f"by {developer}")
+        if location:
+            bits.append(f"in {location}")
+        if ptype:
+            bits.append(ptype)
+        if price:
+            bits.append(f"from AED {price}" if "aed" not in price.lower() else f"from {price}")
+        if plan:
+            bits.append(f"payment plan: {plan}")
+        summary = ", ".join(bits)
+        if desc:
+            summary += (" — " if summary else "") + shorten(desc, 22)
+        lines.append(f"{i}. {name} — {summary}".rstrip(" —"))
+
+    if language == "ar":
+        intro = "بناءً على متطلباتك، هذه أفضل الخيارات المطابقة المتاحة لدي الآن:"
+        outro = "أي خيار ترغب أن أشرح لك تفاصيله أكثر؟"
+    else:
+        intro = "Based on your requirements, these are the best matching options I have available right now:"
+        outro = "Which option would you like to explore further?"
+    return intro + "\n\n" + "\n".join(lines) + "\n\n" + outro
 
 def qualification_missing_fields(session: dict) -> list:
     """Core property requirements that should be known before contact/booking collection."""
@@ -1262,6 +1365,7 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             "lead": {},
             "asked_missing_fields": {},
             "recommendations_shown": False,
+            "recommended_options": [],
             "viewing_requested": False,
         }
 
@@ -1299,6 +1403,30 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
     # A viewing can only be requested after options have been shown.
     if session.get("recommendations_shown") and user_requested_booking(user_message):
         session["viewing_requested"] = True
+
+    # HARD RECOMMENDATION GATE: once qualification is complete, show real database options
+    # before any viewing/contact collection. Do not rely on the LLM to remember this step.
+    if recommendation_stage_ready(session):
+        reply = await build_matching_options_reply(session, language)
+        session["recommendations_shown"] = bool(session.get("recommended_options"))
+        session["history"].append({"role": "user", "content": user_message})
+        session["history"].append({"role": "assistant", "content": reply})
+        if len(session["history"]) > 8:
+            session["history"] = session["history"][-8:]
+        save_chat_log(session_id, user_message, reply)
+        return {
+            "reply": reply, "language": language, "lead_captured": False, "booking_made": False,
+            "viewing_date": session.get("lead", {}).get("viewing_date"),
+            "viewing_time": session.get("lead", {}).get("viewing_time"),
+            "name": session.get("lead", {}).get("name"), "email": session.get("lead", {}).get("email"),
+            "phone": session.get("lead", {}).get("phone"), "interest": session.get("lead", {}).get("interest"),
+            "budget": session.get("lead", {}).get("budget"), "area": session.get("lead", {}).get("area"),
+            "property_type": session.get("lead", {}).get("property_type"), "bedrooms": session.get("lead", {}).get("bedrooms"),
+            "purpose": session.get("lead", {}).get("purpose"), "timeline": session.get("lead", {}).get("timeline"),
+            "recommendations_shown": session.get("recommendations_shown", False),
+            "recommended_options": [{"index": x["index"], "name": x["name"]} for x in session.get("recommended_options", [])],
+            "booking_status": session.get("booking_status", {}),
+        }
 
     # If the client gave a viewing date/time before contact details,
     # NEVER confirm booking yet. Collect name, email, and phone first.
