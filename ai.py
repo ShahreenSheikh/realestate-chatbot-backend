@@ -31,7 +31,7 @@ SYSTEM_PROMPT = """You are a professional real estate sales assistant for {AGENC
 Act like an experienced Dubai property consultant. Your job is to understand the client's needs first, recommend suitable properties from the supplied data, answer questions, and only then help arrange a viewing.
 
 ## REPLY STYLE
-- Maximum 50 words per reply.
+- Usually keep replies concise. When presenting property options, you may use up to 140 words so 2–3 options contain useful facts.
 - Maximum 2 sentences.
 - Ask ONE question at a time.
 - Never ask for information already present in CONFIRMED USER PREFERENCES.
@@ -59,7 +59,7 @@ IMPORTANT:
 - If the user asks about a specific property, answer their question first, then collect only the missing qualification details needed to advise them properly.
 
 ### STAGE 2 — RECOMMEND AND GIVE VALUE
-Once enough requirements are known, recommend 2–3 genuinely relevant options from PROPERTY DATA when available.
+Once ALL core requirements (intent, property type, area, budget, bedrooms, purpose, timeline) are known, you MUST recommend 2–3 genuinely relevant options from PROPERTY DATA before asking about a viewing. Never skip directly to viewing/contact collection.
 Recommendations must respect the latest confirmed area, budget, property type, bedrooms, purpose, timeline, and preferences.
 For each option, briefly mention available facts such as:
 - project/property name and developer
@@ -409,6 +409,15 @@ def fallback_extract_datetime_from_message(message: str):
         },
     )
     if parsed:
+        # Preserve an explicitly typed clock time; dateparser can occasionally inherit
+        # the current minute/hour for short phrases such as "tomorrow at 9".
+        tm = re.search(r"\b(?:at\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", message.lower())
+        if tm:
+            hour = int(tm.group(1)); minute = int(tm.group(2) or 0); ap = tm.group(3)
+            if ap == "pm" and hour < 12: hour += 12
+            if ap == "am" and hour == 12: hour = 0
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                parsed = parsed.replace(hour=hour, minute=minute, second=0, microsecond=0)
         return {
             "viewing_date": parsed.strftime("%Y-%m-%d"),
             "viewing_time": parsed.strftime("%H:%M"),
@@ -747,12 +756,20 @@ def next_qualification_question(session: dict, language: str) -> str | None:
 
 
 def booking_required_fields_ready(session: dict) -> bool:
-    """True only after property qualification AND real booking details are complete."""
+    """Booking is impossible until qualification, recommendations, and viewing consent are complete."""
     lead = session.get("lead", {})
-    return qualification_ready(session) and all(
-        _valid_lead_value(lead.get(k))
-        for k in ["viewing_date", "viewing_time", "name", "email", "phone"]
+    return (
+        qualification_ready(session)
+        and bool(session.get("recommendations_shown"))
+        and bool(session.get("viewing_requested"))
+        and all(_valid_lead_value(lead.get(k)) for k in ["viewing_date", "viewing_time", "name", "email", "phone"])
     )
+
+def recommendation_stage_ready(session: dict) -> bool:
+    return qualification_ready(session) and not session.get("recommendations_shown")
+
+def viewing_can_start(session: dict) -> bool:
+    return qualification_ready(session) and bool(session.get("recommendations_shown")) and bool(session.get("viewing_requested"))
 
 
 def user_requested_booking(message: str) -> bool:
@@ -769,7 +786,9 @@ def user_requested_booking(message: str) -> bool:
 
 
 def booking_started(session: dict) -> bool:
-    """Booking collection starts only after a viewing date/time or contact detail exists."""
+    """Contact/date collection is allowed only after recommendations and explicit viewing consent."""
+    if not viewing_can_start(session):
+        return False
     lead = session.get("lead", {})
     return any(_valid_lead_value(lead.get(k)) for k in ["viewing_date", "viewing_time", "name", "email", "phone"])
 
@@ -1242,6 +1261,8 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             "fallback_history": [],
             "lead": {},
             "asked_missing_fields": {},
+            "recommendations_shown": False,
+            "viewing_requested": False,
         }
 
     session = _sessions[session_id]
@@ -1275,6 +1296,10 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
 
     lead_state = update_lead_state_from_message(session, user_message)
 
+    # A viewing can only be requested after options have been shown.
+    if session.get("recommendations_shown") and user_requested_booking(user_message):
+        session["viewing_requested"] = True
+
     # If the client gave a viewing date/time before contact details,
     # NEVER confirm booking yet. Collect name, email, and phone first.
     if (
@@ -1284,17 +1309,23 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             or _valid_lead_value(session.get("lead", {}).get("viewing_time"))
         )
         and not booking_required_fields_ready(session)
+        and (not qualification_ready(session) or session.get("recommendations_shown"))
     ):
         # A user may mention a viewing time early. Keep it in memory, but finish
         # property qualification before collecting name/email/phone.
         q = next_qualification_question(session, language)
-        if not q:
-            q = next_missing_booking_question(session, language)
-        reply = q or (
-            "Perfect, I can arrange that viewing. What name should I use for the booking?"
-            if language == "en"
-            else "تمام، يمكنني ترتيب المعاينة. ما الاسم الذي أستخدمه للحجز؟"
-        )
+        # If qualification is complete but recommendations have not been shown,
+        # do NOT enter booking collection. Continue below so Cerebras presents options.
+        if not q and not session.get("recommendations_shown"):
+            pass
+        elif not q and not session.get("viewing_requested"):
+            reply = (
+                "I’ll first show you the best matching options. Tell me which one interests you, then I can arrange a viewing."
+                if language == "en" else
+                "سأعرض لك أولاً أفضل الخيارات المطابقة. اختر ما يناسبك، وبعدها يمكنني ترتيب المعاينة."
+            )
+        else:
+            reply = q or next_missing_booking_question(session, language)
         session["history"].append({"role": "user", "content": user_message})
         session["history"].append({"role": "assistant", "content": reply})
         if len(session["history"]) > 8:
@@ -1388,6 +1419,12 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
     ])
 
     llm_user_message = user_message
+    if recommendation_stage_ready(session):
+        llm_user_message += (
+            "\n\nMANDATORY NEXT ACTION: Qualification is complete. Present 2–3 best matching property/project options "
+            "from the supplied PROPERTY DATA now. Include names and available price/location/payment-plan/amenity facts. "
+            "Do not ask for viewing date, name, email, or phone. End by asking which option interests the client."
+        )
     if booking_flow_active_now and is_user_query(user_message):
         llm_user_message = (
             user_message
@@ -1402,7 +1439,7 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             model=CEREBRAS_MODEL,
             messages=messages,
             temperature=0.2,
-            max_tokens=90,
+            max_tokens=320 if recommendation_stage_ready(session) else 120,
         )
         raw = response.choices[0].message.content
     except Exception as e:
@@ -1412,7 +1449,11 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             session["msg_count"] -= 1
         return await handle_llm_failure(session, user_message, language, source, e)
 
-    reply = shorten(clean_reply(raw))
+    was_recommendation_stage = recommendation_stage_ready(session)
+    cleaned = clean_reply(raw)
+    reply = shorten(cleaned, 140 if was_recommendation_stage else 50)
+    if was_recommendation_stage and reply:
+        session["recommendations_shown"] = True
     booking = extract_booking(raw) if not session["booking_made"] else None
 
     # ✅ HANDLE USER QUERY DURING BOOKING FLOW
@@ -1455,8 +1496,11 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
         }
 
     if not reply:
-        q = next_missing_booking_question(session, language)
-        reply = q or "Got it. How can I help you next?"
+        q = next_missing_booking_question(session, language) if viewing_can_start(session) else next_qualification_question(session, language)
+        reply = q or "Which of the matching property options would you like to explore further?"
+
+    if booking and not viewing_can_start(session):
+        booking = None
 
     if booking:
         booking = normalize_booking_datetime(booking)
