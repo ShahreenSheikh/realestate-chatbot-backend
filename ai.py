@@ -28,7 +28,7 @@ SYSTEM_PROMPT = """You are a professional real estate sales assistant for {AGENC
 - Never mix languages.
 
 ## ROLE
-Act like an experienced Dubai property consultant. Your job is to understand the client's needs first, recommend suitable properties from the supplied data, answer questions, and only then help arrange a viewing.
+Act like an experienced Dubai real-estate assistant. FIRST identify what the client actually wants. Not every message is a property-search lead. Answer general real-estate/service questions (Golden Visa, company/services, developers, areas, payment plans, mortgages, FAQs, processes, fees, etc.) directly from supplied data. Only run the property qualification funnel when the user actually wants to buy, rent, invest in, or find a property.
 
 ## REPLY STYLE
 - Usually keep replies concise. When presenting property options, you may use up to 140 words so 2–3 options contain useful facts.
@@ -39,7 +39,13 @@ Act like an experienced Dubai property consultant. Your job is to understand the
 - Be natural and consultative, not like a form or questionnaire.
 - Never invent property details, prices, availability, payment plans, ROI, amenities, or locations.
 
-## REQUIRED SALES FLOW — DO NOT SKIP STEPS
+## INTENT ROUTING — CRITICAL
+- GENERAL / INFORMATION intent: answer the question directly from supplied data. Do NOT force buy/rent/invest qualification.
+- PROPERTY SEARCH intent: only then use the sales flow below.
+- If the user says they have no area preference (any area, anywhere, no preference, none), accept that as a valid preference and do not ask for area again.
+- Never promise to “check and get back later”; either show available data now or say current data has no matching option.
+
+## REQUIRED SALES FLOW — ONLY FOR PROPERTY SEARCH INTENT
 
 ### STAGE 1 — UNDERSTAND THE CLIENT
 Before discussing booking or collecting contact details, qualify the client ONE question at a time. Collect these when relevant:
@@ -548,6 +554,58 @@ def looks_like_non_name_reply(message: str) -> bool:
         return True
     return False
 
+def _normalized_phrase(text: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower()).strip()
+
+
+def has_no_area_preference(text: str) -> bool:
+    compact = _normalized_phrase(text)
+    phrases = {
+        "any", "any area", "anywhere", "any location", "any community",
+        "no preference", "no preferred area", "no area preference", "none",
+        "doesnt matter", "does not matter", "whatever", "you choose", "any is fine"
+    }
+    return compact in phrases or any(compact.startswith(p + " ") for p in ("any area", "no preference"))
+
+
+def is_explicit_property_search(message: str) -> bool:
+    """True when the user is actually asking to find/buy/rent/invest in property."""
+    m = (message or "").lower()
+    # Golden Visa/information uses words like investment, so service intents are excluded first.
+    if is_general_information_intent(message):
+        return False
+    return bool(re.search(r"\b(buy|buying|rent|renting|lease|find|looking for|searching for|off[- ]?plan|apartment|villa|townhouse|property)\b", m) or
+                re.search(r"\b(invest|investment)\b.*\b(property|real estate|apartment|villa|off[- ]?plan)\b", m))
+
+
+def is_general_information_intent(message: str) -> bool:
+    """Route service/FAQ/company questions outside the property qualification funnel."""
+    m = (message or "").lower().strip()
+    info_terms = [
+        "golden visa", "visa", "mortgage", "home loan", "financing", "service", "services",
+        "about your company", "about company", "company", "agency", "who are you", "contact",
+        "developer", "developers", "payment plan", "payment plans", "fees", "fee", "commission",
+        "process", "procedure", "documents", "requirements", "eligibility", "faq", "how does",
+        "how do", "what is", "tell me about", "information about"
+    ]
+    # Specific property detail questions should remain conversational within the property flow.
+    property_detail = any(x in m for x in ["this property", "this apartment", "this villa", "option 1", "option 2", "option 3"])
+    return (not property_detail) and any(term in m for term in info_terms)
+
+
+async def answer_general_information(session: dict, user_message: str, language: str) -> str:
+    """Answer non-search real-estate questions without starting/restarting qualification."""
+    system_prompt = await build_system_prompt(language, user_message)
+    extra = """\n\n## CURRENT ROUTE: GENERAL INFORMATION\nAnswer the user's actual question directly using only the supplied company/service/FAQ/property data. Do NOT ask whether they want to buy, rent, invest, or off-plan unless their question itself requires that distinction. Do NOT start booking or collect contact details. If the supplied data does not contain the answer, say that clearly and offer a specialist rather than inventing facts. Keep the answer concise but complete."""
+    messages = [{"role": "system", "content": system_prompt + extra}]
+    messages += history_to_messages(session.get("history", []))
+    messages.append({"role": "user", "content": user_message})
+    response = client.chat.completions.create(
+        model=CEREBRAS_MODEL, messages=messages, temperature=0.2, max_tokens=500
+    )
+    return clean_reply(response.choices[0].message.content).strip()
+
+
 def update_lead_state_from_message(session: dict, user_message: str):
     """Store booking/contact details deterministically so the AI cannot lose them."""
     lead = session.setdefault("lead", {})
@@ -638,7 +696,10 @@ def update_lead_state_from_message(session: dict, user_message: str):
     elif re.search(r"\b(this month|soon)\b", lowered_msg):
         lead["timeline"] = "Soon"
 
-    # Area extraction
+    # Area extraction. "Any/no preference" is a VALID answer, not a missing field.
+    if has_no_area_preference(msg):
+        lead["area"] = "No preference"
+
     areas = [
         "business bay", "dubai marina", "downtown dubai", "downtown",
         "dubai hills", "dubai hills estate", "palm jumeirah", "jvc",
@@ -650,7 +711,9 @@ def update_lead_state_from_message(session: dict, user_message: str):
         "jvc": "JVC", "jlt": "JLT", "downtown": "Downtown Dubai"
     }
     normalized_area_answer = re.sub(r"[^a-z0-9 ]+", " ", lowered_msg).strip()
-    if normalized_area_answer in area_aliases_direct:
+    if lead.get("area") == "No preference":
+        pass
+    elif normalized_area_answer in area_aliases_direct:
         lead["area"] = area_aliases_direct[normalized_area_answer]
     else:
         for area in areas:
@@ -720,6 +783,8 @@ def update_lead_state_from_message(session: dict, user_message: str):
     }
     compact = re.sub(r"[^a-z0-9 ]+", " ", lowered_msg).strip()
     if ("which area" in last_q or "area in dubai" in last_q or "waterfront area" in last_q or "community" in last_q):
+        if has_no_area_preference(msg):
+            lead["area"] = "No preference"
         for alias, canonical in area_aliases.items():
             if compact == alias or alias in compact:
                 lead["area"] = canonical
@@ -835,14 +900,19 @@ def _recommendation_score(row: dict, lead: dict) -> int:
     ptype = str(lead.get("property_type") or "").lower()
     beds = str(lead.get("bedrooms") or "").lower()
     purpose = str(lead.get("purpose") or "").lower()
-    if area and area in hay:
+    view_pref = str(lead.get("view_preference") or "").lower()
+    if area and area != "no preference" and area in hay:
         score += 12
+    elif area == "no preference":
+        score += 1
     if ptype and ptype in hay:
         score += 5
     if beds and (f"{beds} bed" in hay or f"{beds}br" in hay or f"{beds} bedroom" in hay):
         score += 6
     if "investment" in purpose and any(x in hay for x in ("yield", "roi", "invest")):
         score += 2
+    if "sea view" in view_pref and any(x in hay for x in ("sea view", "waterfront", "beach", "marina", "ocean")):
+        score += 5
     budget = _parse_budget_aed(lead.get("budget"))
     price = _row_price_aed(row)
     if budget and price:
@@ -979,8 +1049,8 @@ def user_requested_booking(message: str) -> bool:
         "let's view", "i want to view", "can i view", "make booking",
         "set up", "reserve", "confirm viewing"
     ]
-    positive_short = {"yes", "sure", "ok", "okay", "go ahead", "yes please", "book it", "schedule it"}
-    return msg in positive_short or any(p in msg for p in booking_phrases)
+    explicit_positive = {"book it", "schedule it", "yes book it", "yes schedule it", "arrange it"}
+    return msg in explicit_positive or any(p in msg for p in booking_phrases)
 
 
 def booking_started(session: dict) -> bool:
@@ -1493,6 +1563,37 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             else:
                 del CACHE[cache_key]
 
+    # ROUTE GENERAL INFORMATION BEFORE PROPERTY QUALIFICATION. This prevents
+    # Golden Visa/FAQ/company/service questions from being forced into buy/rent flow.
+    if is_general_information_intent(user_message) and not is_explicit_property_search(user_message):
+        try:
+            reply = await answer_general_information(session, user_message, language)
+        except Exception as e:
+            print(f"[Cerebras General Info Error]: {e}")
+            reply = (
+                "I don't have enough verified information in the current data to answer that accurately. A property specialist can assist with this."
+                if language == "en" else
+                "لا تتوفر لدي معلومات موثقة كافية في البيانات الحالية للإجابة بدقة. يمكن لمستشار عقاري مساعدتك في ذلك."
+            )
+        session["history"].append({"role": "user", "content": user_message})
+        session["history"].append({"role": "assistant", "content": reply})
+        if len(session["history"]) > 8:
+            session["history"] = session["history"][-8:]
+        save_chat_log(session_id, user_message, reply)
+        return {
+            "reply": reply, "language": language, "lead_captured": False,
+            "booking_made": session.get("booking_made", False),
+            "interest": session.get("lead", {}).get("interest"),
+            "budget": session.get("lead", {}).get("budget"),
+            "area": session.get("lead", {}).get("area"),
+            "property_type": session.get("lead", {}).get("property_type"),
+            "bedrooms": session.get("lead", {}).get("bedrooms"),
+            "purpose": session.get("lead", {}).get("purpose"),
+            "timeline": session.get("lead", {}).get("timeline"),
+            "booking_status": session.get("booking_status", {}),
+            "conversation_route": "general_information",
+        }
+
     lead_state = update_lead_state_from_message(session, user_message)
 
     # HARD QUALIFICATION GATE --------------------------------------------------
@@ -1526,7 +1627,7 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
     # before any viewing/contact collection. Do not rely on the LLM to remember this step.
     if recommendation_stage_ready(session):
         reply = await build_matching_options_reply(session, language)
-        session["recommendations_shown"] = bool(session.get("recommended_options"))
+        session["recommendations_shown"] = True
         session["history"].append({"role": "user", "content": user_message})
         session["history"].append({"role": "assistant", "content": reply})
         if len(session["history"]) > 8:
