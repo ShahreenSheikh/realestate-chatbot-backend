@@ -631,8 +631,12 @@ def update_lead_state_from_message(session: dict, user_message: str):
         lead["view_preference"] = "Sea view"
 
     # Timeline extraction - do NOT treat this as a viewing appointment date.
-    if re.search(r"\bimmediately|asap|ready now|move now|this month|soon\b", lowered_msg):
+    if re.search(r"\b(immediately|asap|ready now|move now)\b", lowered_msg):
         lead["timeline"] = "Immediate"
+    elif re.search(r"\b(within (?:a|one|1) month|next month|in (?:a|one|1) month)\b", lowered_msg):
+        lead["timeline"] = "Within a month"
+    elif re.search(r"\b(this month|soon)\b", lowered_msg):
+        lead["timeline"] = "Soon"
 
     # Area extraction
     areas = [
@@ -641,10 +645,18 @@ def update_lead_state_from_message(session: dict, user_message: str):
         "creek harbour", "dubai creek harbour", "arjan", "damac hills",
         "jumeirah village circle", "jlt", "bluewaters", "meydan",
     ]
-    for area in areas:
-        if area in msg.lower():
-            lead["area"] = area.title()
-            break
+    area_aliases_direct = {
+        "marina": "Dubai Marina", "jbr": "JBR", "palm": "Palm Jumeirah",
+        "jvc": "JVC", "jlt": "JLT", "downtown": "Downtown Dubai"
+    }
+    normalized_area_answer = re.sub(r"[^a-z0-9 ]+", " ", lowered_msg).strip()
+    if normalized_area_answer in area_aliases_direct:
+        lead["area"] = area_aliases_direct[normalized_area_answer]
+    else:
+        for area in areas:
+            if area in msg.lower():
+                lead["area"] = area.title()
+                break
 
     # Interest: store a clean intent instead of the full user sentence.
     if not lead.get("interest") and re.search(r"\b(buy|rent|invest|apartment|villa|townhouse|property|off-plan|marina|hills|downtown|business bay)\b", msg, re.I):
@@ -682,6 +694,63 @@ def update_lead_state_from_message(session: dict, user_message: str):
             clean_name = re.sub(r"^(my name is|i am|i'm|this is)\s+", "", msg, flags=re.I).strip()
             if len(clean_name.split()) <= 4 and len(clean_name) <= 40:
                 lead["name"] = clean_name
+
+    # CONTEXTUAL ANSWER CAPTURE -------------------------------------------------
+    # The user often answers with short values such as "marina", "7000", or
+    # "within a month". Capture those based on the question we just asked so
+    # Python state stays in sync with the natural Cerebras conversation.
+    last_q = last_assistant.lower()
+
+    # Area aliases / short answers.
+    area_aliases = {
+        "marina": "Dubai Marina",
+        "dubai marina": "Dubai Marina",
+        "jbr": "JBR",
+        "palm": "Palm Jumeirah",
+        "palm jumeirah": "Palm Jumeirah",
+        "downtown": "Downtown Dubai",
+        "business bay": "Business Bay",
+        "jvc": "JVC",
+        "jlt": "JLT",
+        "bluewaters": "Bluewaters",
+        "meydan": "Meydan",
+        "arjan": "Arjan",
+        "dubai hills": "Dubai Hills Estate",
+        "creek harbour": "Dubai Creek Harbour",
+    }
+    compact = re.sub(r"[^a-z0-9 ]+", " ", lowered_msg).strip()
+    if ("which area" in last_q or "area in dubai" in last_q or "waterfront area" in last_q or "community" in last_q):
+        for alias, canonical in area_aliases.items():
+            if compact == alias or alias in compact:
+                lead["area"] = canonical
+                break
+
+    # A bare number is a valid budget when it directly answers a budget question.
+    if ("budget" in last_q or "budget range" in last_q) and not _valid_lead_value(lead.get("budget")):
+        bare_budget = re.search(r"(?:aed\s*)?(\d+(?:[.,]\d+)?)\s*(k|m|mil|mn|million)?", lowered_msg, re.I)
+        if bare_budget:
+            raw_amount = bare_budget.group(1).replace(",", "")
+            unit = (bare_budget.group(2) or "").lower()
+            lead["budget"] = f"{raw_amount} {unit}".strip()
+
+    # Natural timeline answers.
+    timeline_patterns = [
+        (r"\b(immediately|asap|right away|now)\b", "Immediate"),
+        (r"\b(within (?:a|one|1) month|next month|in (?:a|one|1) month)\b", "Within a month"),
+        (r"\b(within (?:two|2) months|in (?:two|2) months)\b", "Within 2 months"),
+        (r"\b(within (?:three|3) months|in (?:three|3) months)\b", "Within 3 months"),
+        (r"\b(this month|soon)\b", "Soon"),
+        (r"\b(later|no rush|flexible)\b", "Later / flexible"),
+    ]
+    if "when" in last_q or "move" in last_q or "timeline" in last_q or "complete the purchase" in last_q:
+        for pat, canonical in timeline_patterns:
+            if re.search(pat, lowered_msg, re.I):
+                lead["timeline"] = canonical
+                break
+
+    # If this is a normal residential rental, purpose is implicitly personal use.
+    if "rent" in str(lead.get("interest") or "").lower() and not _valid_lead_value(lead.get("purpose")):
+        lead["purpose"] = "Personal use"
 
     return lead
 
@@ -834,9 +903,19 @@ async def build_matching_options_reply(session: dict, language: str) -> str:
     return intro + "\n\n" + "\n".join(lines) + "\n\n" + outro
 
 def qualification_missing_fields(session: dict) -> list:
-    """Core property requirements that should be known before contact/booking collection."""
+    """Return only genuinely missing property requirements.
+
+    Renters do not need an investment-vs-own-use question: renting a home is
+    treated as personal use unless they explicitly say otherwise. This keeps
+    qualification natural and prevents unnecessary loops.
+    """
     lead = session.get("lead", {})
-    required = ["interest", "property_type", "area", "budget", "bedrooms", "purpose", "timeline"]
+    interest = str(lead.get("interest") or "").lower()
+
+    required = ["interest", "property_type", "area", "budget", "bedrooms", "timeline"]
+    if "rent" not in interest:
+        required.insert(-1, "purpose")
+
     return [k for k in required if not _valid_lead_value(lead.get(k))]
 
 
@@ -845,28 +924,31 @@ def qualification_ready(session: dict) -> bool:
 
 
 def next_qualification_question(session: dict, language: str) -> str | None:
-    """Ask exactly one missing sales-qualification question before booking details."""
+    """Ask exactly one missing sales-qualification question before recommendations."""
     missing = qualification_missing_fields(session)
     if not missing:
         return None
     field = missing[0]
+    lead = session.get("lead", {})
+    is_rent = "rent" in str(lead.get("interest") or "").lower()
+
     en = {
         "interest": "Are you looking to buy, rent, invest, or explore an off-plan property?",
         "property_type": "What type of property are you looking for — apartment, villa, or townhouse?",
         "area": "Which Dubai area or community do you prefer?",
-        "budget": "What budget or budget range are you working with?",
+        "budget": "What is your monthly rental budget?" if is_rent else "What budget or budget range are you working with?",
         "bedrooms": "How many bedrooms do you need?",
         "purpose": "Is the property for your own use or primarily as an investment?",
-        "timeline": "When are you planning to move or complete the purchase?",
+        "timeline": "When would you like to move in?" if is_rent else "When are you planning to move or complete the purchase?",
     }
     ar = {
         "interest": "هل تبحث عن شراء عقار، استئجار، استثمار، أم عقار على المخطط؟",
         "property_type": "ما نوع العقار الذي تبحث عنه: شقة، فيلا، أم تاون هاوس؟",
         "area": "ما المنطقة أو المجتمع الذي تفضله في دبي؟",
-        "budget": "ما الميزانية أو نطاق الميزانية المناسب لك؟",
+        "budget": "ما ميزانيتك الشهرية للإيجار؟" if is_rent else "ما الميزانية أو نطاق الميزانية المناسب لك؟",
         "bedrooms": "كم عدد غرف النوم التي تحتاجها؟",
         "purpose": "هل العقار للاستخدام الشخصي أم للاستثمار بشكل أساسي؟",
-        "timeline": "متى تخطط للانتقال أو إتمام الشراء؟",
+        "timeline": "متى ترغب في الانتقال؟" if is_rent else "متى تخطط للانتقال أو إتمام الشراء؟",
     }
     return (ar if language == "ar" else en).get(field)
 
@@ -1412,6 +1494,29 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
                 del CACHE[cache_key]
 
     lead_state = update_lead_state_from_message(session, user_message)
+
+    # HARD QUALIFICATION GATE --------------------------------------------------
+    # Qualification is controlled by Python, not by Cerebras. Once a value is
+    # captured it is never re-asked unless the user explicitly changes it.
+    if not qualification_ready(session):
+        q = next_qualification_question(session, language)
+        if q:
+            session["history"].append({"role": "user", "content": user_message})
+            session["history"].append({"role": "assistant", "content": q})
+            if len(session["history"]) > 8:
+                session["history"] = session["history"][-8:]
+            save_chat_log(session_id, user_message, q)
+            return {
+                "reply": q, "language": language, "lead_captured": False, "booking_made": False,
+                "viewing_date": session.get("lead", {}).get("viewing_date"),
+                "viewing_time": session.get("lead", {}).get("viewing_time"),
+                "name": session.get("lead", {}).get("name"), "email": session.get("lead", {}).get("email"),
+                "phone": session.get("lead", {}).get("phone"), "interest": session.get("lead", {}).get("interest"),
+                "budget": session.get("lead", {}).get("budget"), "area": session.get("lead", {}).get("area"),
+                "property_type": session.get("lead", {}).get("property_type"), "bedrooms": session.get("lead", {}).get("bedrooms"),
+                "purpose": session.get("lead", {}).get("purpose"), "timeline": session.get("lead", {}).get("timeline"),
+                "booking_status": session.get("booking_status", {}),
+            }
 
     # A viewing can only be requested after options have been shown.
     if session.get("recommendations_shown") and user_requested_booking(user_message):
