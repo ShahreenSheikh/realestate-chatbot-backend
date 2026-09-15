@@ -923,19 +923,112 @@ def _recommendation_score(row: dict, lead: dict) -> int:
     return score
 
 
+def _norm_text(value) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _row_matches_explicit_area(row: dict, lead: dict) -> bool:
+    """Never silently recommend another area when the client named a location."""
+    area = _norm_text(lead.get("area"))
+    if not area or area == "no preference":
+        return True
+    hay = _norm_text(" ".join(str(v or "") for v in (row or {}).values()))
+    aliases = {
+        "dubai marina": ["dubai marina", "marina"],
+        "downtown dubai": ["downtown dubai", "downtown"],
+        "dubai creek harbour": ["dubai creek harbour", "creek harbour"],
+        "dubai hills estate": ["dubai hills estate", "dubai hills"],
+        "palm jumeirah": ["palm jumeirah", "the palm"],
+        "business bay": ["business bay"],
+        "jbr": ["jbr", "jumeirah beach residence"],
+    }
+    needles = aliases.get(area, [area])
+    return any(_norm_text(n) in hay for n in needles)
+
+
+def _row_matches_property_type(row: dict, lead: dict) -> bool:
+    ptype = _norm_text(lead.get("property_type"))
+    if not ptype:
+        return True
+    # Only reject when the row actually exposes a type/category field.
+    declared = " ".join(str(_safe_get(row, k) or "") for k in ("type", "property_type", "category", "unit_type"))
+    if not declared.strip():
+        return True
+    return ptype in _norm_text(declared)
+
+
+def _find_selected_option(session: dict, message: str):
+    """Resolve 'the Emaar South one', option numbers, and exact/partial names."""
+    opts = session.get("recommended_options") or []
+    if not opts:
+        return None
+    msg = _norm_text(message)
+    m = re.search(r"(?:option|number|no)?\s*([1-9])\b", msg)
+    if m:
+        idx = int(m.group(1))
+        for opt in opts:
+            if opt.get("index") == idx:
+                return opt
+    for opt in opts:
+        name = _norm_text(opt.get("name"))
+        if name and (name in msg or msg in name):
+            return opt
+    # tolerate filler words around the project name
+    stripped = re.sub(r"\b(the|one|project|property|option|please|show|me|tell|about)\b", " ", msg)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    for opt in opts:
+        name = _norm_text(opt.get("name"))
+        if stripped and (name in stripped or stripped in name):
+            return opt
+    return None
+
+
+def _selected_option_reply(opt: dict, language: str = "en") -> str:
+    """Render selected-property facts deterministically so an LLM cannot truncate or alter them."""
+    row = opt.get("row") or {}
+    name = opt.get("name") or "Selected property"
+    developer = _safe_get(row, "developer")
+    location = _safe_get(row, "location") or _safe_get(row, "area")
+    ptype = _safe_get(row, "type") or _safe_get(row, "property_type")
+    price = _safe_get(row, "price") or _safe_get(row, "starting_price") or _safe_get(row, "price_from")
+    plan = _safe_get(row, "plan") or _safe_get(row, "payment_plan")
+    handover = _safe_get(row, "handover") or _safe_get(row, "completion") or _safe_get(row, "completion_date")
+    desc = _safe_get(row, "description")
+    facts=[]
+    if developer: facts.append(f"Developer: {developer}")
+    if location: facts.append(f"Location: {location}")
+    if ptype: facts.append(f"Property type: {ptype}")
+    if price:
+        facts.append(f"Starting price: {price}" if "aed" in str(price).lower() else f"Starting price: AED {price}")
+    if plan: facts.append(f"Payment plan: {plan}")
+    if handover: facts.append(f"Handover: {handover}")
+    if desc: facts.append(shorten(desc, 35))
+    if language == "ar":
+        return f"{name}\n" + "\n".join(facts) + "\n\nهل ترغب أن أرتب لك معاينة أو أن أشرح المزيد عن هذا العقار؟"
+    return f"{name}\n" + "\n".join(facts) + "\n\nWould you like me to arrange a viewing, or would you like more details about this property?"
+
+
+def _is_simple_yes(message: str) -> bool:
+    return _norm_text(message) in {"yes", "yeah", "yep", "sure", "okay", "ok", "please do", "yes please", "نعم", "ايوه"}
+
+
 async def build_matching_options_reply(session: dict, language: str) -> str:
     """Build the recommendation stage from database rows so the model cannot skip the actual options."""
     lead = session.get("lead", {})
     projects = await get_projects() or []
     crawled = await get_crawled_properties() or []
     rows = projects + crawled
-    ranked = sorted(rows, key=lambda r: _recommendation_score(r, lead), reverse=True)
+    # Explicit location is a hard constraint. Never present Dubai South as a
+    # "match" for Downtown Dubai merely because its price/type scores well.
+    eligible = [r for r in rows if _row_matches_explicit_area(r, lead) and _row_matches_property_type(r, lead)]
+    ranked = sorted(eligible, key=lambda r: _recommendation_score(r, lead), reverse=True)
     ranked = [r for r in ranked if _recommendation_score(r, lead) > 0][:3]
 
     if not ranked:
+        area = lead.get("area")
         if language == "ar":
-            return "لدي متطلباتك الآن، لكن لا توجد خيارات مطابقة كافية في بيانات العقارات الحالية. هل ترغب أن أطلب من مستشار عقاري البحث عن خيارات مناسبة لك؟"
-        return "I have your requirements, but I don't have enough matching listings in the current property data to present real options. Would you like a property specialist to find suitable matches for you?"
+            return f"لدي متطلباتك، لكن لا توجد في بياناتي الحالية خيارات مطابقة مؤكدة في {area or 'المنطقة المطلوبة'}. يمكنني توسيع البحث إلى مناطق أخرى إذا رغبت، أو طلب مساعدة مستشار عقاري."
+        return f"I have your requirements, but I don't currently have a verified matching option in {area or 'your preferred area'} in the available listing data. I can broaden the search to other areas if you'd like, or have a property specialist find a closer match."
 
     session["recommended_options"] = []
     lines = []
@@ -1532,6 +1625,8 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             "recommendations_shown": False,
             "recommended_options": [],
             "viewing_requested": False,
+            "selected_option": None,
+            "awaiting_viewing_confirmation": False,
         }
 
     session = _sessions[session_id]
@@ -1595,6 +1690,46 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
         }
 
     lead_state = update_lead_state_from_message(session, user_message)
+
+    # PROPERTY-SELECTION STATE ------------------------------------------------
+    # Once options are shown, project names/numbers are resolved in Python and
+    # stay selected. A later "yes" therefore continues the selected-property
+    # flow instead of asking the user to choose the same option again.
+    if session.get("recommendations_shown"):
+        selected = _find_selected_option(session, user_message)
+        if selected:
+            session["selected_option"] = selected
+            session["awaiting_viewing_confirmation"] = True
+            reply = _selected_option_reply(selected, language)
+            session["history"].append({"role": "user", "content": user_message})
+            session["history"].append({"role": "assistant", "content": reply})
+            if len(session["history"]) > 8:
+                session["history"] = session["history"][-8:]
+            save_chat_log(session_id, user_message, reply)
+            return {
+                "reply": reply, "language": language, "lead_captured": False, "booking_made": False,
+                "interest": session.get("lead", {}).get("interest"), "budget": session.get("lead", {}).get("budget"),
+                "area": session.get("lead", {}).get("area"), "property_type": session.get("lead", {}).get("property_type"),
+                "bedrooms": session.get("lead", {}).get("bedrooms"), "purpose": session.get("lead", {}).get("purpose"),
+                "timeline": session.get("lead", {}).get("timeline"), "selected_property": selected.get("name"),
+                "recommendations_shown": True, "booking_status": session.get("booking_status", {}),
+            }
+
+        if session.get("selected_option") and session.get("awaiting_viewing_confirmation") and _is_simple_yes(user_message):
+            session["viewing_requested"] = True
+            session["awaiting_viewing_confirmation"] = False
+            reply = next_missing_booking_question(session, language) or ("What day and time would suit you for the viewing?" if language == "en" else "ما اليوم والوقت المناسبان للمعاينة؟")
+            session["history"].append({"role": "user", "content": user_message})
+            session["history"].append({"role": "assistant", "content": reply})
+            save_chat_log(session_id, user_message, reply)
+            return {
+                "reply": reply, "language": language, "lead_captured": False, "booking_made": False,
+                "interest": session.get("lead", {}).get("interest"), "budget": session.get("lead", {}).get("budget"),
+                "area": session.get("lead", {}).get("area"), "property_type": session.get("lead", {}).get("property_type"),
+                "bedrooms": session.get("lead", {}).get("bedrooms"), "purpose": session.get("lead", {}).get("purpose"),
+                "timeline": session.get("lead", {}).get("timeline"), "selected_property": session["selected_option"].get("name"),
+                "recommendations_shown": True, "viewing_requested": True, "booking_status": session.get("booking_status", {}),
+            }
 
     # HARD QUALIFICATION GATE --------------------------------------------------
     # Qualification is controlled by Python, not by Cerebras. Once a value is
@@ -1786,7 +1921,7 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             model=CEREBRAS_MODEL,
             messages=messages,
             temperature=0.2,
-            max_tokens=700 if recommendation_stage_ready(session) else 500,
+            max_tokens=1200,
         )
         raw = response.choices[0].message.content
     except Exception as e:
