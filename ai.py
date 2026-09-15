@@ -289,12 +289,25 @@ def clean_reply(text: str) -> str:
 
 
 def shorten(text: str, max_w: int = 50) -> str:
-    words = (text or "").split()
-    if len(words) <= max_w:
-        return text or ""
-    trimmed = " ".join(words[:max_w])
-    sentences = re.split(r'(?<=[.!?])\s+', trimmed)
-    return sentences[0].strip() if len(sentences) > 1 else trimmed
+    """Shorten fallback/static text without ever chopping a sentence mid-way."""
+    text = (text or "").strip()
+    if len(text.split()) <= max_w:
+        return text
+
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    kept = []
+    count = 0
+    for sentence in sentences:
+        words = sentence.split()
+        if kept and count + len(words) > max_w:
+            break
+        kept.append(sentence)
+        count += len(words)
+        if count >= max_w:
+            break
+
+    # If the first sentence itself exceeds max_w, return it whole rather than truncating it.
+    return " ".join(kept).strip() if kept else text
 
 
 def history_to_messages(history: list) -> list:
@@ -1567,7 +1580,7 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
             model=CEREBRAS_MODEL,
             messages=messages,
             temperature=0.2,
-            max_tokens=320 if recommendation_stage_ready(session) else 120,
+            max_tokens=700 if recommendation_stage_ready(session) else 500,
         )
         raw = response.choices[0].message.content
     except Exception as e:
@@ -1578,8 +1591,10 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
         return await handle_llm_failure(session, user_message, language, source, e)
 
     was_recommendation_stage = recommendation_stage_ready(session)
+    # Do not hard-truncate Cerebras output. The system prompt controls normal reply
+    # length; hard word/token clipping can leave questions visibly unfinished.
     cleaned = clean_reply(raw)
-    reply = shorten(cleaned, 140 if was_recommendation_stage else 50)
+    reply = cleaned.strip()
     if was_recommendation_stage and reply:
         session["recommendations_shown"] = True
     booking = extract_booking(raw) if not session["booking_made"] else None
