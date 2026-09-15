@@ -14,8 +14,8 @@ import time
 CACHE = {}
 CACHE_TTL = 300  # 5 minutes
 
-client = OpenAI(api_key=os.getenv("GROQ_API_KEY"), base_url="https://api.groq.com/openai/v1")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+client = OpenAI(api_key=os.getenv("CEREBRAS_API_KEY"), base_url="https://api.cerebras.ai/v1")
+CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
 AGENT_NAME = os.getenv("AGENT_NAME", "Omar Hassan")
 AGENCY = os.getenv("AGENCY_NAME", "Zahra Signature Realty")
 AGENCY_CONTEXT = os.getenv("AGENCY_CONTEXT", "Dubai property brokerage focused on trusted, premium real estate guidance.")
@@ -199,7 +199,7 @@ def pick_relevant_rows(rows: list, user_message: str, matched_limit: int = 5, fa
 async def build_system_prompt(language: str, user_message: str = "") -> str:
     """Build a small per-message prompt from the full sheet data.
 
-    This avoids sending the whole sheet to Groq on every message while still
+    This avoids sending the whole sheet to Cerebras on every message while still
     allowing the backend to search the whole sheet with simple keywords.
     """
     services = await get_all_services()
@@ -924,7 +924,7 @@ def fallback_collect_and_book_response(session: dict, user_message: str, languag
 async def post_booking_fallback_reply(user_message: str, session: dict, language: str) -> str:
     """Safe fallback after booking is completed.
 
-    Important: after booking, users may still ask normal questions. If Groq fails
+    Important: after booking, users may still ask normal questions. If Cerebras fails
     or rate-limits, we still answer simple company/property questions instead of
     repeating "your booking is confirmed".
     """
@@ -993,7 +993,7 @@ async def post_booking_fallback_reply(user_message: str, session: dict, language
 
 
 async def handle_llm_failure(session: dict, user_message: str, language: str, source: str, error: Exception) -> dict:
-    """Fallback path when Groq/LLM fails.
+    """Fallback path when Cerebras/LLM fails.
 
     If booking is not completed, deterministic fallback continues collecting details
     and can still create the booking. If booking is already completed, LLM is only
@@ -1321,7 +1321,7 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
         }
 
     # Build a small, relevant prompt per message. Full sheet data remains in Python,
-    # but only matching rows are sent to Groq to reduce token usage.
+    # but only matching rows are sent to Cerebras to reduce token usage.
     retrieval_query = " ".join(
         [user_message] + [
             m.get("content", "")
@@ -1360,7 +1360,7 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
 
     try:
         response = client.chat.completions.create(
-            model=GROQ_MODEL,
+            model=CEREBRAS_MODEL,
             messages=messages,
             temperature=0.2,
             max_tokens=90,
@@ -1368,7 +1368,7 @@ async def get_ai_response(session_id: str, user_message: str, source: str = "web
         raw = response.choices[0].message.content
     except Exception as e:
         error_str = str(e)
-        print(f"[Groq Error]: {error_str}")
+        print(f"[Cerebras Error]: {error_str}")
         if "429" in error_str or "rate_limit" in error_str.lower():
             session["msg_count"] -= 1
         return await handle_llm_failure(session, user_message, language, source, e)
